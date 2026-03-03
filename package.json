@@ -1,0 +1,62 @@
+{
+	"name": "@oomfware/lang-detect",
+	"version": "0.0.0",
+	"description": "natural language detection library",
+	"license": "0BSD",
+	"repository": {
+		"type": "git",
+		"url": "https://codeberg.org/oomfware/lang-detect"
+	},
+	"files": [
+		"dist/",
+		"src/",
+		"weights/",
+		"!src/**/*.bench.ts",
+		"!src/**/*.test.ts"
+	],
+	"type": "module",
+	"types": "./dist/index.d.ts",
+	"imports": {
+		"#load": {
+			"source": "./src/nn/load.node.ts",
+			"node": "./dist/nn/load.node.js",
+			"default": "./dist/nn/load.js"
+		}
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./lite": {
+			"types": "./dist/lite.d.ts",
+			"default": "./dist/lite.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "tsc",
+		"dev": "tsc --watch",
+		"typecheck": "tsc --noEmit",
+		"fmt": "oxfmt",
+		"lint": "oxlint",
+		"eval": "node --conditions source src/eval.ts",
+		"test": "node --test --conditions source src/**/*.test.ts",
+		"prepublishOnly": "pnpm run build",
+		"download-dataset": "cd train && bash download_dataset.sh",
+		"export": "pnpm run export:standard && pnpm run export:lite",
+		"export:standard": "cd train && uv run export.py -e pruned_mega_aug50 -o ../weights/standard",
+		"export:lite": "cd train && uv run export.py -e pruned_mega_aug50 -o ../weights/lite --quant-bits 6"
+	},
+	"devDependencies": {
+		"@types/node": "^25.3.3",
+		"bumpp": "^10.4.1",
+		"lande": "^1.0.10",
+		"oxfmt": "^0.36.0",
+		"oxlint": "^1.51.0",
+		"typescript": "^5.9.3"
+	}
+}
