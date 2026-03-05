@@ -19,30 +19,13 @@ const { values: args } = parseArgs({
 });
 
 const variant = args.lite ? 'lite' : 'standard';
-const quantBits = args.lite ? 6 : 8;
 
-const weightsDir = path.resolve(import.meta.dirname!, '..', 'weights', variant);
-const { initialize, detect } = create(
-	{
-		cyrillic: {
-			weights: new URL(`file://${path.join(weightsDir, 'cyrillic.bin')}`),
-			meta: new URL(`file://${path.join(weightsDir, 'cyrillic.json')}`),
-		},
-		arabic: {
-			weights: new URL(`file://${path.join(weightsDir, 'arabic.bin')}`),
-			meta: new URL(`file://${path.join(weightsDir, 'arabic.json')}`),
-		},
-		devanagari: {
-			weights: new URL(`file://${path.join(weightsDir, 'devanagari.bin')}`),
-			meta: new URL(`file://${path.join(weightsDir, 'devanagari.json')}`),
-		},
-		latin: {
-			weights: new URL(`file://${path.join(weightsDir, 'latin.bin')}`),
-			meta: new URL(`file://${path.join(weightsDir, 'latin.json')}`),
-		},
-	},
-	quantBits,
-);
+const { initialize, detect } = create({
+	cyrillic: new URL(`../weights/${variant}/cyrillic.bin`, import.meta.url),
+	arabic: new URL(`../weights/${variant}/arabic.bin`, import.meta.url),
+	devanagari: new URL(`../weights/${variant}/devanagari.bin`, import.meta.url),
+	latin: new URL(`../weights/${variant}/latin.bin`, import.meta.url),
+});
 
 // ── UDHR code → ISO 639-3 mapping ──
 
@@ -53,7 +36,7 @@ const UDHR_CODE_TO_LANG: Record<string, string> = {
 	bul: 'bul',
 	cat: 'cat',
 	ces: 'ces',
-	ckb: 'ckb',
+	// ckb UDHR is Latin-script Kurmanji; our model trains Arabic-script Sorani
 	cmn_hans: 'cmn',
 	dan: 'dan',
 	deu_1996: 'deu',
@@ -158,7 +141,7 @@ const evaluate = (name: string, detectFn: (text: string) => string | undefined) 
 
 await initialize();
 
-evaluate(`UDHR: ${variant} (${quantBits}-bit)`, (text) => {
+evaluate(`UDHR: ${variant}`, (text) => {
 	const result = detect(text);
 	return result[0]?.[0];
 });

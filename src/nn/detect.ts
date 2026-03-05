@@ -1,40 +1,12 @@
-import { loadBinary, loadJson } from '#load';
+import { loadBinary } from '#load';
 
-import { forward, loadWeights, loadWeights6, type ModelWeights } from './forward.ts';
+import { forward, loadModel, type GroupNgrams, type ReadyModel } from './forward.ts';
 import { normalize, extractNgrams } from './normalize.ts';
 
 // #region types
 
 /** a single detection result: ISO 639-3 language code and its probability. */
 export type Detection = [lang: string, probability: number];
-
-/** URLs for a single group's weight + metadata files. */
-type GroupSource = {
-	weights: URL;
-	meta: URL;
-};
-
-/** ngram vocabulary lists that define the input vector layout for a group model. */
-type GroupNgrams = {
-	unigrams: string[];
-	bigrams: string[];
-	trigrams: string[];
-	quadgrams: string[];
-};
-
-/** weight metadata loaded from a group's .json file. */
-type GroupMeta = {
-	langs: string[];
-	ngrams: GroupNgrams;
-	inputSize: number;
-	outputSize: number;
-};
-
-/** a loaded group model ready for inference. */
-type ReadyModel = {
-	meta: GroupMeta;
-	weights: ModelWeights;
-};
 
 /** returned by {@link create} — call initialize() once, then detect() synchronously. */
 type Detector = {
@@ -160,45 +132,23 @@ const buildInput = (text: string, ngrams: GroupNgrams): Float32Array => {
 
 // #endregion
 
-// #region weight loading
-
-/**
- * loads and dequantizes weights for a single group from its binary + metadata files.
- *
- * @param source URLs for the group's weight and metadata files
- * @param quantBits quantization bit width (8 or 6)
- * @returns the loaded model ready for inference
- */
-const loadGroup = async (source: GroupSource, quantBits: number): Promise<ReadyModel> => {
-	const [bin, rawMeta] = await Promise.all([loadBinary(source.weights), loadJson(source.meta)]);
-	const meta = rawMeta as GroupMeta;
-
-	const load = quantBits === 6 ? loadWeights6 : loadWeights;
-	const weights = load(bin, meta.inputSize, meta.outputSize);
-
-	return { meta, weights };
-};
-
-// #endregion
-
 // #region detection
 
 /**
  * creates a detector for a specific weight variant.
  *
- * call initialize() once to load and dequantize weights via fetch(), then
+ * call initialize() once to load and dequantize weights, then
  * call detect() synchronously for each input text.
  *
- * @param sources record of group names to their weight/meta file URLs
- * @param quantBits quantization bit width (default 8)
+ * @param sources record of group names to their binary file URLs
  * @returns detector with initialize() and detect() methods
  */
-export const create = (sources: Record<string, GroupSource>, quantBits = 8): Detector => {
+export const create = (sources: Record<string, URL>): Detector => {
 	let models: Record<string, ReadyModel> | null = null;
 
 	const initialize = async () => {
 		const entries = Object.entries(sources);
-		const loaded = await Promise.all(entries.map(([, source]) => loadGroup(source, quantBits)));
+		const loaded = await Promise.all(entries.map(([, url]) => loadBinary(url).then(loadModel)));
 
 		models = {};
 		for (let i = 0; i < entries.length; i++) {

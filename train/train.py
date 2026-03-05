@@ -2,7 +2,7 @@
 lang-detect training pipeline.
 
 usage:
-    uv run train.py                    # train default (pruned_mega)
+    uv run train.py                    # train default (pruned_mega_focal_aug75)
     uv run train.py -e NAME            # run a named experiment
     uv run train.py -l                 # list available experiments
 """
@@ -14,7 +14,6 @@ import random
 import re
 import sys
 import time
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,17 +23,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
+from datasets import (
+    DATASET_TRAIN_LIMIT,
+    NGRAM_TYPES,
+    RawDatum,
+    load_dataset_raw,
+    make_datum,
+)
 from experiments import EXPERIMENTS
 
 # ── constants ──
 
-TATOEBA_PATH = Path(__file__).parent / "resources" / "tatoeba.csv"
-UDHR_PATH = Path(__file__).parent / "resources" / "udhr"
-DATASET_TRAIN_LENGTH_MIN = 40
-DATASET_TRAIN_LIMIT = 9000
 DATASET_TRAIN_PERC = 0.8
-
-NGRAM_TYPES = ["unigrams", "bigrams", "trigrams", "quadgrams"]
 
 # ── script groups ──
 
@@ -62,7 +62,6 @@ class GroupConfig:
     quadgrams: int
     batch_size: int = 32
     epochs: int = 64
-    filter_by_script: bool = False  # filter training data by group's script regex (for dual-script langs)
 
 
 GROUPS: dict[str, GroupConfig] = {
@@ -133,232 +132,6 @@ def load_checkpoint(
         results[group_name] = (model, ckpt["ngram_vocabs"], ckpt["accuracy"])
 
     return results
-
-
-# ── text normalization ──
-
-HYPHEN_RE = re.compile(r"-+")
-MULTI_SPACE_RE = re.compile(r"\s{2,}")
-
-
-def _is_letter_mark_or_space(c: str) -> bool:
-    r"""match JS regex [^\p{L}\p{M}\s] — keep letters, marks, and whitespace."""
-    cat = unicodedata.category(c)
-    return cat.startswith("L") or cat.startswith("M") or c.isspace()
-
-
-def normalize(text: str) -> str:
-    """normalize text for ngram extraction, matching the JS implementation."""
-    text = HYPHEN_RE.sub(" ", text)
-    text = "".join(c for c in text if _is_letter_mark_or_space(c))
-    text = MULTI_SPACE_RE.sub(" ", text)
-    text = text.lower().strip()
-    return f" {text} "
-
-
-@dataclass
-class NgramData:
-    counts: dict[str, int]
-    freqs: dict[str, float]
-
-
-def extract_ngrams(text: str, n: int) -> NgramData:
-    """extract ngram counts and frequencies from normalized text."""
-    counts: dict[str, int] = {}
-    total = 0
-    for i in range(len(text) - n + 1):
-        gram = text[i:i + n]
-        counts[gram] = counts.get(gram, 0) + 1
-        total += 1
-
-    if total == 0:
-        return NgramData(counts={}, freqs={})
-    freqs = {gram: count / total for gram, count in counts.items()}
-    return NgramData(counts=counts, freqs=freqs)
-
-
-# ── dataset loading ──
-
-@dataclass
-class RawDatum:
-    lang: str
-    sentence: str
-    ngrams: dict[str, NgramData]  # {type: NgramData}
-
-
-def _make_datum(sentence: str) -> RawDatum:
-    """create a RawDatum from a raw sentence string."""
-    norm = normalize(sentence)
-    ngrams = {
-        "unigrams": extract_ngrams(norm, 1),
-        "bigrams": extract_ngrams(norm, 2),
-        "trigrams": extract_ngrams(norm, 3),
-        "quadgrams": extract_ngrams(norm, 4),
-    }
-    return RawDatum(lang="", sentence=sentence, ngrams=ngrams)
-
-
-def load_tatoeba(langs_set: set[str], limit: int) -> dict[str, list[RawDatum]]:
-    """load sentences from the Tatoeba dataset using reservoir sampling for uniform selection."""
-    # reservoir sampling: uniformly sample `limit` sentences per language in a single pass.
-    # short sentences (< DATASET_TRAIN_LENGTH_MIN) are collected separately as fallback.
-    primary: dict[str, list[RawDatum]] = {lang: [] for lang in langs_set}
-    primary_seen: dict[str, int] = {lang: 0 for lang in langs_set}
-    fallback: dict[str, list[RawDatum]] = {lang: [] for lang in langs_set}
-    fallback_seen: dict[str, int] = {lang: 0 for lang in langs_set}
-
-    rng = random.Random(42)
-
-    with open(TATOEBA_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3:
-                continue
-            _, lang, sentence = parts
-            if lang not in langs_set:
-                continue
-
-            is_long = len(sentence) >= DATASET_TRAIN_LENGTH_MIN
-
-            if is_long:
-                n = primary_seen[lang]
-                primary_seen[lang] = n + 1
-                if n < limit:
-                    primary[lang].append((sentence, n))
-                else:
-                    j = rng.randint(0, n)
-                    if j < limit:
-                        primary[lang][j] = (sentence, n)
-            else:
-                n = fallback_seen[lang]
-                fallback_seen[lang] = n + 1
-                if n < limit:
-                    fallback[lang].append((sentence, n))
-                else:
-                    j = rng.randint(0, n)
-                    if j < limit:
-                        fallback[lang][j] = (sentence, n)
-
-    # convert to RawDatum and fill from fallback if needed
-    result: dict[str, list[RawDatum]] = {}
-    for lang in langs_set:
-        data = [_make_datum(s) for s, _ in primary[lang]]
-        for d in data:
-            d.lang = lang
-        needed = max(0, limit - len(data))
-        if needed > 0:
-            fb = [_make_datum(s) for s, _ in fallback[lang][:needed]]
-            for d in fb:
-                d.lang = lang
-            data.extend(fb)
-        result[lang] = data
-
-    return result
-
-
-# curated mapping from UDHR file codes to our language codes.
-# only standard/modern variants — excludes dialects (068=Welche), historical orthographies,
-# and non-standard scripts (vie_han, tgl_tglg).
-UDHR_CODE_TO_LANG: dict[str, str] = {
-    "afr": "afr",
-    "bel": "bel",
-    "ben": "ben",
-    "bul": "bul",
-    "cat": "cat",
-    "ces": "ces",
-    "ckb": "ckb",
-    "cmn_hans": "cmn",
-    "dan": "dan",
-    "deu_1996": "deu",
-    "ell_monotonic": "ell",
-    "eng": "eng",
-    "eus": "eus",
-    "fin": "fin",
-    "fra": "fra",
-    "hau_NG": "hau",
-    "heb": "heb",
-    "hin": "hin",
-    "hrv": "hrv",
-    "hun": "hun",
-    "hye": "hye",
-    "ind": "ind",
-    "isl": "isl",
-    "ita": "ita",
-    "jpn": "jpn",
-    "kat": "kat",
-    "kaz": "kaz",
-    "kor": "kor",
-    "lit": "lit",
-    "mar": "mar",
-    "mkd": "mkd",
-    "nld": "nld",
-    "nob": "nob",
-    "pes_1": "pes",
-    "pol": "pol",
-    "por_BR": "por",
-    "por_PT": "por",
-    "ron_2006": "ron",
-    "run": "run",
-    "rus": "rus",
-    "slk": "slk",
-    "spa": "spa",
-    "srp_cyrl": "srp",
-    "srp_latn": "srp",
-    "swe": "swe",
-    "tgl": "tgl",
-    "tur": "tur",
-    "ukr": "ukr",
-    "vie": "vie",
-}
-
-
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def load_udhr(langs_set: set[str]) -> dict[str, list[RawDatum]]:
-    """load paragraphs from the UDHR HTML declarations."""
-    decl_dir = UDHR_PATH / "declaration"
-    if not decl_dir.exists():
-        return {}
-
-    result: dict[str, list[RawDatum]] = {}
-
-    for code, lang in UDHR_CODE_TO_LANG.items():
-        if lang not in langs_set:
-            continue
-
-        html_file = decl_dir / f"{code}.html"
-        if not html_file.exists():
-            continue
-
-        content = html_file.read_text(encoding="utf-8")
-        for match in re.finditer(r"<p>(.*?)</p>", content, re.DOTALL):
-            text = _HTML_TAG_RE.sub("", match.group(1)).strip()
-            if len(text) < 10:
-                continue
-            datum = _make_datum(text)
-            datum.lang = lang
-            result.setdefault(lang, []).append(datum)
-
-    return result
-
-
-def load_dataset_raw(langs: list[str], limit: int = DATASET_TRAIN_LIMIT) -> dict[str, list[RawDatum]]:
-    """load and preprocess training data from Tatoeba + UDHR."""
-    langs_set = set(langs)
-
-    # load from both sources
-    tatoeba = load_tatoeba(langs_set, limit)
-    udhr = load_udhr(langs_set)
-
-    # merge: Tatoeba is primary, UDHR supplements
-    result: dict[str, list[RawDatum]] = {}
-    for lang in langs:
-        t_data = tatoeba.get(lang, [])
-        u_data = udhr.get(lang, [])
-        result[lang] = t_data + u_data
-
-    return result
 
 
 # ── ngram selection ──
@@ -456,7 +229,7 @@ def _truncate_datum(datum: RawDatum, max_chars: int) -> RawDatum:
     # snap to word boundary
     cut = s[:max_chars].rfind(" ")
     s = s[:cut] if cut > 5 else s[:max_chars]
-    result = _make_datum(s)
+    result = make_datum(s)
     result.lang = datum.lang
     return result
 
@@ -493,8 +266,6 @@ def prepare_dataset(
 
     for lang in langs:
         data = raw.get(lang, [])
-        if config.filter_by_script:
-            data = [d for d in data if config.test.search(d.sentence)]
         lang_idx = langs.index(lang)
 
         split_idx = int(len(data) * DATASET_TRAIN_PERC)
@@ -526,7 +297,10 @@ def prepare_dataset(
     return train_x, train_y, test_x, test_y, ngram_vocabs
 
 
-def _build_feature_vector(datum: RawDatum, ngram_vocabs: dict[str, list[str]]) -> list[float]:
+def _build_feature_vector(
+    datum: RawDatum,
+    ngram_vocabs: dict[str, list[str]],
+) -> list[float]:
     """build the input feature vector for a datum given ngram vocabularies."""
     vec: list[float] = []
     for ngram_type in NGRAM_TYPES:
@@ -541,11 +315,43 @@ def _build_feature_vector(datum: RawDatum, ngram_vocabs: dict[str, list[str]]) -
 
 # ── training ──
 
+class FocalLoss(nn.Module):
+    """focal loss: down-weights easy examples to focus on hard/misclassified ones.
+
+    FL(p) = -alpha * (1 - p)^gamma * log(p)
+    when gamma=0, equivalent to cross-entropy. gamma=2 is standard.
+    """
+
+    def __init__(self, gamma: float = 2.0, label_smoothing: float = 0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        num_classes = logits.size(1)
+        log_probs = torch.log_softmax(logits, dim=1)
+        probs = log_probs.exp()
+
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                smooth = torch.full_like(log_probs, self.label_smoothing / (num_classes - 1))
+                smooth.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+        else:
+            smooth = torch.zeros_like(log_probs)
+            smooth.scatter_(1, targets.unsqueeze(1), 1.0)
+
+        # focal weight: (1 - p_t)^gamma
+        focal_weight = (1.0 - probs).pow(self.gamma)
+        loss = -(focal_weight * smooth * log_probs).sum(dim=1)
+        return loss.mean()
+
+
 @dataclass
 class TrainConfig:
     """training hyperparameters beyond the group architecture."""
     lr: float = 0.001
     label_smoothing: float = 0.0
+    focal_gamma: float = 0.0  # focal loss gamma (0.0 = standard cross-entropy)
     data_limit: int = DATASET_TRAIN_LIMIT  # sentences per language
     truncate_aug: float = 0.0  # fraction of training data to duplicate as truncated (15-40 char) copies
 
@@ -571,7 +377,8 @@ def train_group(
         print(f"\n--- {config.name} ({len(langs)} langs, {config.epochs} epochs, batch {config.batch_size}) ---")
 
     train_x, train_y, test_x, test_y, ngram_vocabs = prepare_dataset(
-        raw, langs, config, preset_vocabs, truncate_aug=train_cfg.truncate_aug,
+        raw, langs, config, preset_vocabs,
+        truncate_aug=train_cfg.truncate_aug,
     )
     if verbose:
         print(f"  train: {len(train_x)}, test: {len(test_x)}")
@@ -579,7 +386,10 @@ def train_group(
     input_size = sum(len(v) for v in ngram_vocabs.values())
     model = nn.Linear(input_size, len(langs))
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.label_smoothing)
+    if train_cfg.focal_gamma > 0:
+        criterion = FocalLoss(gamma=train_cfg.focal_gamma, label_smoothing=train_cfg.label_smoothing)
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
     train_dataset = TensorDataset(train_x, train_y)
@@ -683,7 +493,7 @@ def _infer(
     text: str,
 ) -> str:
     """run inference on a single text, return the predicted language."""
-    datum = _make_datum(text)
+    datum = make_datum(text)
     vec = _build_feature_vector(datum, ngram_vocabs)
     x = torch.tensor([vec], dtype=torch.float32)
     model.eval()
@@ -711,9 +521,9 @@ def run_full_pipeline(
     preset_vocabs: dict[str, dict[str, list[str]]] | None = None,
 ) -> dict[str, tuple[nn.Module, dict[str, list[str]], float]]:
     """
-    train all groups and run end-to-end evaluation.
+    train all groups.
 
-    returns: {group_name: (model, ngram_vocabs, accuracy)}
+    returns: {group_name: (model, ngram_vocabs, test_accuracy)}
     """
     if train_cfg is None:
         train_cfg = TrainConfig()
@@ -723,13 +533,8 @@ def run_full_pipeline(
         lang for g in groups.values() for lang in g.langs
     ))
 
-    unique_script_langs = list(UNIQUE_SCRIPT_LANGS.keys())
-    cjk_langs = ["jpn", "cmn"]
-    all_langs = list(dict.fromkeys(unique_script_langs + cjk_langs + all_nn_langs))
-
     if verbose:
-        print(f"loading dataset for {len(all_nn_langs)} NN languages "
-              f"+ {len(unique_script_langs) + len(cjk_langs)} script-detected...")
+        print(f"loading dataset for {len(all_nn_langs)} NN languages...")
         t0 = time.time()
 
     raw = load_dataset_raw(all_nn_langs, limit=train_cfg.data_limit)
@@ -757,57 +562,10 @@ def run_full_pipeline(
         if verbose:
             print(f"  params: {params:,} — trained in {dt:.1f}s")
 
-    # end-to-end evaluation
     if verbose:
-        print(f"\n--- full end-to-end test ---")
-
-    full_raw = load_dataset_raw(all_langs, limit=train_cfg.data_limit)
-    test_sentences: list[tuple[str, str]] = []
-    for lang in all_langs:
-        data = full_raw.get(lang, [])
-        split_idx = int(len(data) * DATASET_TRAIN_PERC)
-        for datum in data[split_idx:]:
-            test_sentences.append((lang, datum.sentence))
-
-    overall_acc, per_lang = evaluate(test_sentences, groups, results)
-
-    if verbose:
-        total = len(test_sentences)
-        passed = int(overall_acc / 100 * total)
-        print(f"\n  overall accuracy: {overall_acc:.2f}%")
-        print(f"  pass: {passed}, fail: {total - passed}, total: {total}")
-        print(f"  total params: {total_params:,}")
-
-        # weight sizes
-        total_binary = 0
-        for group_name, (model, _, _) in results.items():
-            size = _calc_binary_size(model)
-            total_binary += size
+        total_binary = sum(_calc_binary_size(m) for m, _, _ in results.values())
+        print(f"\n  total params: {total_params:,}")
         print(f"  total int8 binary: {total_binary / 1024:.1f}KB")
-
-        # per-language accuracy (sorted by accuracy ascending to show weakest first)
-        print(f"\n  per-language accuracy:")
-        lang_accs = sorted(per_lang.items(), key=lambda x: x[1][0])
-        for lang, (acc, total) in lang_accs:
-            print(f"    {lang}: {acc:.1f}% ({total})")
-
-    # fixed UDHR evaluation (comparable across experiments)
-    if verbose:
-        udhr_data = load_udhr(set(all_langs))
-        if udhr_data:
-            udhr_sentences: list[tuple[str, str]] = []
-            for lang, items in udhr_data.items():
-                for datum in items:
-                    udhr_sentences.append((lang, datum.sentence))
-
-            udhr_acc, udhr_per_lang = evaluate(udhr_sentences, groups, results)
-            print(f"\n--- fixed UDHR eval ({len(udhr_sentences)} sentences, {len(udhr_per_lang)} langs) ---")
-            print(f"  overall accuracy: {udhr_acc:.2f}%")
-
-            udhr_accs = sorted(udhr_per_lang.items(), key=lambda x: x[1][0])
-            for lang, (acc, total) in udhr_accs:
-                if acc < 100.0:
-                    print(f"    {lang}: {acc:.1f}% ({total})")
 
     return results
 
@@ -816,7 +574,7 @@ def run_full_pipeline(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="lang-detect training")
-    parser.add_argument("--experiment", "-e", default="pruned_mega",
+    parser.add_argument("--experiment", "-e", default="pruned_mega_focal_aug75",
                         help="experiment name to run")
     parser.add_argument("--list", "-l", action="store_true",
                         help="list available experiments")

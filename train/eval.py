@@ -10,15 +10,13 @@ from __future__ import annotations
 import argparse
 import sys
 
+from datasets import DATASET_TRAIN_LIMIT, load_tatoeba, load_udhr
 from experiments import EXPERIMENTS
 from train import (
-    DATASET_TRAIN_LIMIT,
     DATASET_TRAIN_PERC,
     UNIQUE_SCRIPT_LANGS,
     evaluate,
     load_checkpoint,
-    load_tatoeba,
-    load_udhr,
     resolve_groups,
 )
 
