@@ -1,6 +1,6 @@
 {
 	"name": "@oomfware/lang-detect",
-	"version": "0.0.0",
+	"version": "0.1.0",
 	"description": "natural language detection library",
 	"license": "0BSD",
 	"repository": {
