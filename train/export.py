@@ -152,8 +152,8 @@ def main() -> None:
                         help="experiment name to export")
     parser.add_argument("--output", "-o", type=Path, required=True,
                         help="output directory for weight files")
-    parser.add_argument("--quant-bits", type=int, default=8, choices=[6, 8],
-                        help="quantization bit width (default: 8)")
+    parser.add_argument("--quant-bits", type=int, default=None, choices=[6, 8],
+                        help="quantization bit width (overrides experiment config)")
     parser.add_argument("--global-quant", action="store_true",
                         help="use global (per-tensor) instead of per-row weight quantization")
     args = parser.parse_args()
@@ -163,12 +163,22 @@ def main() -> None:
         print(f"available: {', '.join(EXPERIMENTS.keys())}")
         sys.exit(1)
 
+    exp = EXPERIMENTS[args.experiment]
     groups = resolve_groups(args.experiment)
     results = load_checkpoint(args.experiment, groups)
 
-    print(f"exporting weights to {args.output}/ (int{args.quant_bits})")
+    # resolve per-group quant bits: CLI flag > experiment config > default (8)
+    exp_quant = exp.get("quant_bits", 8)
+
+    print(f"exporting weights to {args.output}/")
     for group_name, (model, ngram_vocabs, _) in results.items():
-        export_weights(model, ngram_vocabs, groups[group_name].langs, args.output, group_name, args.quant_bits, args.global_quant)
+        if args.quant_bits is not None:
+            quant_bits = args.quant_bits
+        elif isinstance(exp_quant, dict):
+            quant_bits = exp_quant.get(group_name, 8)
+        else:
+            quant_bits = exp_quant
+        export_weights(model, ngram_vocabs, groups[group_name].langs, args.output, group_name, quant_bits, args.global_quant)
 
 
 if __name__ == "__main__":

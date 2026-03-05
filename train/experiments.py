@@ -17,6 +17,7 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
         "description": "focal gamma=2 + 75% truncation aug + Leipzig (shipped standard)",
         "prune_from": "linear_mega",
         "train_cfg": {"label_smoothing": 0.1, "truncate_aug": 0.75, "focal_gamma": 2.0},
+        "quant_bits": {"cyrillic": 6, "arabic": 6, "devanagari": 6, "latin": 8},
     },
     "pruned_compact_focal": {
         "description": "compact ngrams + focal loss + aug75 + Leipzig (shipped lite)",
@@ -28,5 +29,6 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
             "latin": {"unigrams": 150, "bigrams": 400, "trigrams": 400, "quadgrams": 250},
         },
         "train_cfg": {"label_smoothing": 0.1, "truncate_aug": 0.75, "focal_gamma": 2.0},
+        "quant_bits": 6,
     },
 }
