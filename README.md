@@ -35,7 +35,7 @@ two variants are available, trading accuracy for smaller weights:
 | subpath   | weights | accuracy |
 | --------- | ------- | -------- |
 | (default) | 74.9 kB | 97.4%    |
-| `/lite`   | 48.3 kB | 97.3%    |
+| `/lite`   | 48.3 kB | 97.2%    |
 
 ```ts
 import { initialize, detect } from '@oomfware/lang-detect/lite';
