@@ -2,7 +2,7 @@
  * evaluate detection accuracy against the UDHR dataset.
  *
  * usage:
- *   node --conditions source src/eval.ts [--lite] [--lande]
+ *   node --conditions source src/eval.ts [--lande]
  */
 
 import fs from 'node:fs';
@@ -13,18 +13,15 @@ import { create } from './nn/detect.ts';
 
 const { values: args } = parseArgs({
 	options: {
-		lite: { type: 'boolean', default: false },
 		lande: { type: 'boolean', default: false },
 	},
 });
 
-const variant = args.lite ? 'lite' : 'standard';
-
 const { initialize, detect } = create({
-	cyrillic: new URL(`../weights/${variant}/cyrillic.bin`, import.meta.url),
-	arabic: new URL(`../weights/${variant}/arabic.bin`, import.meta.url),
-	devanagari: new URL(`../weights/${variant}/devanagari.bin`, import.meta.url),
-	latin: new URL(`../weights/${variant}/latin.bin`, import.meta.url),
+	cyrillic: new URL('../weights/standard/cyrillic.bin', import.meta.url),
+	arabic: new URL('../weights/standard/arabic.bin', import.meta.url),
+	devanagari: new URL('../weights/standard/devanagari.bin', import.meta.url),
+	latin: new URL('../weights/standard/latin.bin', import.meta.url),
 });
 
 // ── UDHR code → ISO 639-3 mapping ──
@@ -141,7 +138,7 @@ const evaluate = (name: string, detectFn: (text: string) => string | undefined) 
 
 await initialize();
 
-evaluate(`UDHR: ${variant}`, (text) => {
+evaluate('UDHR: standard', (text) => {
 	const result = detect(text);
 	return result[0]?.[0];
 });

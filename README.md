@@ -28,19 +28,6 @@ const results = detect('Hello Мир');
 // -> [['eng', ...], ['rus', ...]]
 ```
 
-### variants
-
-two variants are available, trading accuracy for smaller weights:
-
-| subpath   | weights | accuracy |
-| --------- | ------- | -------- |
-| (default) | 74.9 kB | 97.4%    |
-| `/lite`   | 48.3 kB | 97.2%    |
-
-```ts
-import { initialize, detect } from '@oomfware/lang-detect/lite';
-```
-
 ### supported languages
 
 50 languages across Latin, Cyrillic, Arabic, Devanagari, CJK, and unique-script families.

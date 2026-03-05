@@ -28,10 +28,6 @@
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
 		},
-		"./lite": {
-			"types": "./dist/lite.d.ts",
-			"default": "./dist/lite.js"
-		},
 		"./package.json": "./package.json"
 	},
 	"publishConfig": {
@@ -47,12 +43,8 @@
 		"test": "node --test --conditions source src/**/*.test.ts",
 		"prepublishOnly": "pnpm run build",
 		"download-dataset": "cd train && bash download_dataset.sh",
-		"train": "cd train && uv run train.py",
-		"train:standard": "cd train && uv run train.py -e pruned_mega_focal_aug75",
-		"train:lite": "cd train && uv run train.py -e pruned_compact_focal",
-		"export": "pnpm run export:standard && pnpm run export:lite",
-		"export:standard": "cd train && uv run export.py -e pruned_mega_focal_aug75 -o ../weights/standard",
-		"export:lite": "cd train && uv run export.py -e pruned_compact_focal -o ../weights/lite"
+		"train": "cd train && uv run train.py -e pruned_compact_focal",
+		"export": "cd train && uv run export.py -e pruned_compact_focal -o ../weights/standard"
 	},
 	"devDependencies": {
 		"@types/node": "^25.3.3",

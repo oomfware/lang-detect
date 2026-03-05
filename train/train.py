@@ -2,7 +2,6 @@
 lang-detect training pipeline.
 
 usage:
-    uv run train.py                    # train default (pruned_mega_focal_aug75)
     uv run train.py -e NAME            # run a named experiment
     uv run train.py -l                 # list available experiments
 """
@@ -574,7 +573,7 @@ def run_full_pipeline(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="lang-detect training")
-    parser.add_argument("--experiment", "-e", default="pruned_mega_focal_aug75",
+    parser.add_argument("--experiment", "-e", required=True,
                         help="experiment name to run")
     parser.add_argument("--list", "-l", action="store_true",
                         help="list available experiments")
