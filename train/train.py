@@ -605,10 +605,7 @@ def main() -> None:
     if "prune_from" in exp:
         # two-phase: train wide model, prune by importance, retrain
         wide_exp = EXPERIMENTS[exp["prune_from"]]
-        wide_groups = {}
-        for name, config in GROUPS.items():
-            overrides = wide_exp.get("overrides", {}).get(name, {})
-            wide_groups[name] = GroupConfig(**{**vars(config), **overrides}) if overrides else config
+        wide_groups = resolve_groups(exp["prune_from"])
         wide_train_cfg = TrainConfig(**wide_exp.get("train_cfg", {}))
 
         print("\n=== phase 1: training wide models for importance analysis ===")

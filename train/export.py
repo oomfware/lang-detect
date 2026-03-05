@@ -16,10 +16,9 @@ from pathlib import Path
 
 import torch
 
+from datasets import NGRAM_TYPES
 from experiments import EXPERIMENTS
 from train import load_checkpoint, resolve_groups
-
-NGRAM_KEYS = ["unigrams", "bigrams", "trigrams", "quadgrams"]
 
 
 def quantize_tensor(tensor: torch.Tensor, scale_max: int = 127) -> tuple[bytes, float]:
@@ -103,7 +102,7 @@ def export_weights(
     scale_max = 31 if quant_bits == 6 else 127
     output_size = model.out_features
     input_size = model.in_features
-    ngram_counts = [len(ngram_vocabs.get(k, [])) for k in NGRAM_KEYS]
+    ngram_counts = [len(ngram_vocabs.get(k, [])) for k in NGRAM_TYPES]
 
     # quantize
     if global_quant:
@@ -118,7 +117,7 @@ def export_weights(
 
     # encode strings
     all_ngrams: list[str] = []
-    for k in NGRAM_KEYS:
+    for k in NGRAM_TYPES:
         all_ngrams.extend(ngram_vocabs.get(k, []))
     langs_bytes = _encode_strings(langs)
     ngrams_bytes = _encode_strings(all_ngrams)

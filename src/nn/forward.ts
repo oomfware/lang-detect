@@ -12,8 +12,6 @@ export type GroupNgrams = {
 export type GroupMeta = {
 	langs: string[];
 	ngrams: GroupNgrams;
-	inputSize: number;
-	outputSize: number;
 };
 
 /** float32 weights for a linear model (dense → softmax). */
@@ -215,7 +213,7 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 	}
 
 	return {
-		meta: { langs, ngrams, inputSize, outputSize },
+		meta: { langs, ngrams },
 		weights: { w, b, inputSize, outputSize },
 	};
 };

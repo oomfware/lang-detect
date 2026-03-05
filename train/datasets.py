@@ -94,9 +94,9 @@ def load_tatoeba(langs_set: set[str], limit: int) -> dict[str, list[RawDatum]]:
 	"""load sentences from the Tatoeba dataset using reservoir sampling for uniform selection."""
 	# reservoir sampling: uniformly sample `limit` sentences per language in a single pass.
 	# short sentences (< DATASET_TRAIN_LENGTH_MIN) are collected separately as fallback.
-	primary: dict[str, list[RawDatum]] = {lang: [] for lang in langs_set}
+	primary: dict[str, list[tuple[str, int]]] = {lang: [] for lang in langs_set}
 	primary_seen: dict[str, int] = {lang: 0 for lang in langs_set}
-	fallback: dict[str, list[RawDatum]] = {lang: [] for lang in langs_set}
+	fallback: dict[str, list[tuple[str, int]]] = {lang: [] for lang in langs_set}
 	fallback_seen: dict[str, int] = {lang: 0 for lang in langs_set}
 
 	rng = random.Random(42)
