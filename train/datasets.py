@@ -23,7 +23,7 @@ LEIPZIG_PATH = RESOURCES_PATH / "leipzig"
 DATASET_TRAIN_LENGTH_MIN = 40
 DATASET_TRAIN_LIMIT = 9000
 
-NGRAM_TYPES = ["unigrams", "bigrams", "trigrams", "quadgrams"]
+NGRAM_TYPES = ["unigrams", "bigrams", "trigrams", "quadgrams", "pentagrams"]
 
 # ── text normalization ──
 
@@ -84,6 +84,7 @@ def make_datum(sentence: str) -> RawDatum:
 		"bigrams": extract_ngrams(norm, 2),
 		"trigrams": extract_ngrams(norm, 3),
 		"quadgrams": extract_ngrams(norm, 4),
+		"pentagrams": extract_ngrams(norm, 5),
 	}
 	return RawDatum(lang="", sentence=sentence, ngrams=ngrams)
 

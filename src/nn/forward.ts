@@ -6,6 +6,7 @@ export type GroupNgrams = {
 	bigrams: string[];
 	trigrams: string[];
 	quadgrams: string[];
+	pentagrams: string[];
 };
 
 /** metadata parsed from a group's binary file header. */
@@ -142,10 +143,10 @@ const readStrings = (bytes: Uint8Array, offset: number, count: number): [string[
 };
 
 /**
- * loads a group model from a v2 binary file containing metadata + quantized weights.
+ * loads a group model from a v3 binary file containing metadata + quantized weights.
  *
  * binary format:
- *   header (16 bytes): "LD" version(2) quantBits outputSize inputSize ngramCounts[4]
+ *   header (18 bytes): "LD" version(3) quantBits outputSize inputSize ngramCounts[5]
  *   strings: null-terminated UTF-8 (langs then ngrams in type order)
  *   scales: f32le[outputSize] wScales, f32le bScale
  *   data: quantized weights (int8 or packed int6), then bias
@@ -166,10 +167,11 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 		view.getUint16(10, true),
 		view.getUint16(12, true),
 		view.getUint16(14, true),
+		view.getUint16(16, true),
 	];
 
 	// strings
-	let pos = 16;
+	let pos = 18;
 	const [langs, afterLangs] = readStrings(bytes, pos, outputSize);
 	pos = afterLangs;
 	const [allNgrams, afterNgrams] = readStrings(bytes, pos, inputSize);
@@ -182,6 +184,7 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 		bigrams: allNgrams.slice(ni, (ni += ngramCounts[1])),
 		trigrams: allNgrams.slice(ni, (ni += ngramCounts[2])),
 		quadgrams: allNgrams.slice(ni, (ni += ngramCounts[3])),
+		pentagrams: allNgrams.slice(ni, (ni += ngramCounts[4])),
 	};
 
 	// scales (per-row weight scales + single bias scale)

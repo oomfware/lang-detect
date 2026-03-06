@@ -119,12 +119,14 @@ const buildInput = (text: string, ngrams: GroupNgrams): Float32Array => {
 	const bigrams = extractNgrams(text, 2);
 	const trigrams = extractNgrams(text, 3);
 	const quadgrams = extractNgrams(text, 4);
+	const pentagrams = ngrams.pentagrams.length > 0 ? extractNgrams(text, 5) : {};
 
 	const values = [
 		...ngrams.unigrams.map((v) => unigrams[v] || 0),
 		...ngrams.bigrams.map((v) => bigrams[v] || 0),
 		...ngrams.trigrams.map((v) => trigrams[v] || 0),
 		...ngrams.quadgrams.map((v) => quadgrams[v] || 0),
+		...ngrams.pentagrams.map((v) => pentagrams[v] || 0),
 	];
 
 	return new Float32Array(values);

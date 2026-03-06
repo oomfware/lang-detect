@@ -90,9 +90,9 @@ def export_weights(
 ) -> None:
     """export linear model weights + metadata to a single binary file.
 
-    format (v2):
-      header: "LD" u8 version(2) u8 quantBits u16le outputSize u16le inputSize
-              u16le[4] ngramCounts
+    format (v3):
+      header (18 bytes): "LD" u8 version(3) u8 quantBits u16le outputSize u16le inputSize
+              u16le[5] ngramCounts
       strings: null-terminated UTF-8 (langs then ngrams in type order)
       scales: f32le[outputSize] wScales, f32le bScale
       data: quantized weights (int8 or packed int6), then bias
@@ -126,9 +126,9 @@ def export_weights(
     with open(bin_path, "wb") as f:
         # header (16 bytes)
         f.write(b"LD")
-        f.write(struct.pack("<2B", 2, quant_bits))
+        f.write(struct.pack("<2B", 3, quant_bits))
         f.write(struct.pack("<2H", output_size, input_size))
-        f.write(struct.pack("<4H", *ngram_counts))
+        f.write(struct.pack("<5H", *ngram_counts))
 
         # strings
         f.write(langs_bytes)

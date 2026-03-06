@@ -49,6 +49,17 @@ UNIQUE_SCRIPT_LANGS = {
 CJK_JPN = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
 CJK_CMN = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF]")
 
+# unique character markers within the Cyrillic script group.
+# these characters appear exclusively in one language of our Cyrillic group,
+# enabling quick identification before falling through to the NN classifier.
+CYRILLIC_UNIQUE_CHARS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"[\u0402\u0452\u040B\u045B]"), "srp"),   # Ђђ Ћћ
+    (re.compile(r"[\u0403\u0453\u040C\u045C\u0405\u0455]"), "mkd"),  # Ѓѓ Ќќ Ѕѕ
+    (re.compile(r"[\u040E\u045E]"), "bel"),                # Ўў
+    (re.compile(r"[\u0407\u0457\u0404\u0454]"), "ukr"),    # Її Єє
+    (re.compile(r"[\u04D8\u04D9\u0492\u0493\u049A\u049B\u04A2\u04A3\u04E8\u04E9\u04AE\u04AF]"), "kaz"),  # Әә Ғғ Ққ Ңң Өө Үү
+]
+
 
 @dataclass
 class GroupConfig:
@@ -59,6 +70,7 @@ class GroupConfig:
     bigrams: int
     trigrams: int
     quadgrams: int
+    pentagrams: int = 0
     batch_size: int = 32
     epochs: int = 64
 
@@ -254,6 +266,7 @@ def prepare_dataset(
             "bigrams": select_ngrams_roundrobin(raw, langs, config.bigrams, "bigrams"),
             "trigrams": select_ngrams_roundrobin(raw, langs, config.trigrams, "trigrams"),
             "quadgrams": select_ngrams_roundrobin(raw, langs, config.quadgrams, "quadgrams"),
+            "pentagrams": select_ngrams_roundrobin(raw, langs, config.pentagrams, "pentagrams"),
         }
 
     train_inputs: list[list[float]] = []
@@ -363,11 +376,7 @@ def train_group(
     verbose: bool = True,
     preset_vocabs: dict[str, list[str]] | None = None,
 ) -> tuple[nn.Module, dict[str, list[str]], float]:
-    """
-    train a linear model for a single script group.
-
-    returns: (model, ngram_vocabs, test_accuracy)
-    """
+    """train a linear model for a single script group."""
     if train_cfg is None:
         train_cfg = TrainConfig()
 
@@ -391,8 +400,9 @@ def train_group(
         criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr)
 
-    train_dataset = TensorDataset(train_x, train_y)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    train_loader = DataLoader(
+        TensorDataset(train_x, train_y), batch_size=config.batch_size, shuffle=True,
+    )
 
     model.train()
     for epoch in range(config.epochs):
@@ -402,6 +412,7 @@ def train_group(
             optimizer.zero_grad()
             output = model(batch_x)
             loss = criterion(output, batch_y)
+
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
@@ -446,12 +457,17 @@ def detect_language(
     # NN group detection
     for group_name, config in groups.items():
         if config.test.search(sentence):
+            # unique character pre-filtering within Cyrillic
+            if group_name == "cyrillic":
+                for pattern, lang in CYRILLIC_UNIQUE_CHARS:
+                    if pattern.search(sentence):
+                        return lang
             model, ngram_vocabs, _ = results[group_name]
-            return _infer(model, config.langs, ngram_vocabs, sentence)
+            return _infer(model, config, ngram_vocabs, sentence)
 
     # fallback to latin
     model, ngram_vocabs, _ = results["latin"]
-    return _infer(model, groups["latin"].langs, ngram_vocabs, sentence)
+    return _infer(model, groups["latin"], ngram_vocabs, sentence)
 
 
 def evaluate(
@@ -487,7 +503,7 @@ def evaluate(
 
 def _infer(
     model: nn.Module,
-    langs: list[str],
+    config: GroupConfig,
     ngram_vocabs: dict[str, list[str]],
     text: str,
 ) -> str:
@@ -500,16 +516,30 @@ def _infer(
         logits = model(x)
         pred = logits.argmax(dim=1).item()
 
-    return langs[pred]
+    return config.langs[pred]
 
 
 # ── full pipeline ──
 
-def _calc_binary_size(model: nn.Module) -> int:
-    """calculate the quantized binary weight size for a model."""
-    num_params = len(list(model.parameters()))
-    total_weights = sum(p.numel() for p in model.parameters())
-    return total_weights + num_params * 4  # scale floats × 4 bytes each
+def _calc_binary_size(
+    model: nn.Module,
+    ngram_vocabs: dict[str, list[str]],
+    langs: list[str],
+    quant_bits: int = 6,
+) -> int:
+    """calculate the exported binary size for a model."""
+    output_size = model.out_features
+    input_size = model.in_features
+    header = 18
+    lang_bytes = sum(len(l.encode("utf-8")) + 1 for l in langs)
+    ngram_bytes = sum(len(g.encode("utf-8")) + 1 for v in ngram_vocabs.values() for g in v)
+    scales = output_size * 4 + 4
+    total_values = output_size * input_size + output_size
+    if quant_bits == 6:
+        data = (total_values * 6 + 7) // 8
+    else:
+        data = total_values
+    return header + lang_bytes + ngram_bytes + scales + data
 
 
 def run_full_pipeline(
@@ -519,11 +549,7 @@ def run_full_pipeline(
     verbose: bool = True,
     preset_vocabs: dict[str, dict[str, list[str]]] | None = None,
 ) -> dict[str, tuple[nn.Module, dict[str, list[str]], float]]:
-    """
-    train all groups.
-
-    returns: {group_name: (model, ngram_vocabs, test_accuracy)}
-    """
+    """train all groups."""
     if train_cfg is None:
         train_cfg = TrainConfig()
 
@@ -562,9 +588,12 @@ def run_full_pipeline(
             print(f"  params: {params:,} — trained in {dt:.1f}s")
 
     if verbose:
-        total_binary = sum(_calc_binary_size(m) for m, _, _ in results.values())
+        total_binary = sum(
+            _calc_binary_size(m, v, groups[g].langs)
+            for g, (m, v, _) in results.items()
+        )
         print(f"\n  total params: {total_params:,}")
-        print(f"  total int8 binary: {total_binary / 1024:.1f}KB")
+        print(f"  estimated int6 binary: {total_binary / 1024:.1f}KB")
 
     return results
 
@@ -623,6 +652,7 @@ def main() -> None:
                 "bigrams": target.bigrams,
                 "trigrams": target.trigrams,
                 "quadgrams": target.quadgrams,
+                "pentagrams": target.pentagrams,
             }
             pruned = select_ngrams_by_importance(model, vocabs, target_sizes)
 
