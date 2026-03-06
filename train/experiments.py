@@ -13,14 +13,14 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
         },
         "train_cfg": {"label_smoothing": 0.1},
     },
-    "rebalanced_5g": {
-        "description": "steal bytes from overprovisioned small groups, add 5-grams to Latin (shipped)",
+    "lean_v5": {
+        "description": "halved small groups, lean ratio favoring short n-grams",
         "prune_from": "linear_mega_5g",
         "overrides": {
             "cyrillic": {"unigrams": 130, "bigrams": 280, "trigrams": 280, "quadgrams": 130},
-            "arabic": {"unigrams": 50, "bigrams": 100, "trigrams": 100, "quadgrams": 50},
-            "devanagari": {"unigrams": 30, "bigrams": 60, "trigrams": 60, "quadgrams": 30},
-            "latin": {"unigrams": 150, "bigrams": 400, "trigrams": 400, "quadgrams": 250, "pentagrams": 100},
+            "arabic": {"unigrams": 25, "bigrams": 50, "trigrams": 50, "quadgrams": 25},
+            "devanagari": {"unigrams": 15, "bigrams": 30, "trigrams": 30, "quadgrams": 15},
+            "latin": {"unigrams": 165, "bigrams": 425, "trigrams": 425, "quadgrams": 235, "pentagrams": 90},
         },
         "train_cfg": {"label_smoothing": 0.1, "truncate_aug": 0.75, "focal_gamma": 2.0},
         "quant_bits": 6,

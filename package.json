@@ -43,8 +43,8 @@
 		"test": "node --test --conditions source src/**/*.test.ts",
 		"prepublishOnly": "pnpm run build",
 		"download-dataset": "cd train && bash download_dataset.sh",
-		"train": "cd train && uv run train.py -e rebalanced_5g",
-		"export": "cd train && uv run export.py -e rebalanced_5g -o ../weights/standard"
+		"train": "cd train && uv run train.py -e lean_v5",
+		"export": "cd train && uv run export.py -e lean_v5 -o ../weights/standard"
 	},
 	"devDependencies": {
 		"@types/node": "^25.3.3",
