@@ -78,7 +78,12 @@ const classifyCodepoint = (cp: number): ScriptFamily | null => {
 	if (cp >= 0x0900 && cp <= 0x097f) {
 		return 'devanagari';
 	}
-	if ((cp >= 0x0041 && cp <= 0x005a) || (cp >= 0x0061 && cp <= 0x007a) || (cp >= 0x00c0 && cp <= 0x024f)) {
+	if (
+		(cp >= 0x0041 && cp <= 0x005a) ||
+		(cp >= 0x0061 && cp <= 0x007a) ||
+		(cp >= 0x00c0 && cp <= 0x024f) ||
+		(cp >= 0x1e00 && cp <= 0x1eff)
+	) {
 		return 'latin';
 	}
 
