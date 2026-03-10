@@ -10,7 +10,7 @@ const MULTI_SPACE_RE = /\s{2,}/g;
  * @returns normalized text padded with leading/trailing spaces
  */
 export const normalize = (text: string): string => {
-	return ` ${text.replace(HYPHEN_RE, ' ').replace(NON_LETTER_RE, '').replace(MULTI_SPACE_RE, ' ').toLowerCase().trim()} `;
+	return ` ${text.normalize('NFC').replace(HYPHEN_RE, ' ').replace(NON_LETTER_RE, '').replace(MULTI_SPACE_RE, ' ').toLowerCase().trim()} `;
 };
 
 /**

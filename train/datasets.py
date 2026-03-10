@@ -39,6 +39,7 @@ def _is_letter_mark_or_space(c: str) -> bool:
 
 def normalize(text: str) -> str:
 	"""normalize text for ngram extraction, matching the JS implementation."""
+	text = unicodedata.normalize("NFC", text)
 	text = HYPHEN_RE.sub(" ", text)
 	text = "".join(c for c in text if _is_letter_mark_or_space(c))
 	text = MULTI_SPACE_RE.sub(" ", text)
