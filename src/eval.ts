@@ -82,7 +82,7 @@ const TAG_RE = /<[^>]+>/g;
 
 // ── load UDHR sentences ──
 
-const declDir = path.resolve(import.meta.dirname!, '..', 'train', 'resources', 'udhr', 'declaration');
+const declDir = path.resolve(import.meta.dirname, '..', 'train', 'resources', 'udhr', 'declaration');
 const sentences: { lang: string; text: string }[] = [];
 
 for (const [code, lang] of Object.entries(UDHR_CODE_TO_LANG)) {
@@ -125,6 +125,7 @@ const evaluate = (name: string, detectFn: (text: string) => string | undefined) 
 	console.log(`${sentences.length} sentences, ${Object.keys(perLang).length} languages`);
 	console.log(`overall accuracy: ${overallAcc.toFixed(2)}%`);
 
+	// oxlint-disable-next-line unicorn/no-array-sort
 	const sorted = Object.entries(perLang).sort((a, b) => a[1].pass / a[1].total - b[1].pass / b[1].total);
 	for (const [lang, stats] of sorted) {
 		const acc = (stats.pass / stats.total) * 100;
