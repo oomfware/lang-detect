@@ -125,7 +125,7 @@ const evaluate = (name: string, detectFn: (text: string) => string | undefined) 
 	console.log(`${sentences.length} sentences, ${Object.keys(perLang).length} languages`);
 	console.log(`overall accuracy: ${overallAcc.toFixed(2)}%`);
 
-	// oxlint-disable-next-line unicorn/no-array-sort
+	// oxlint-disable-next-line unicorn/no-array-sort -- mutating a temporary array is fine here
 	const sorted = Object.entries(perLang).sort((a, b) => a[1].pass / a[1].total - b[1].pass / b[1].total);
 	for (const [lang, stats] of sorted) {
 		const acc = (stats.pass / stats.total) * 100;

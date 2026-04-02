@@ -36,7 +36,6 @@
 	"scripts": {
 		"build": "tsc",
 		"dev": "tsc --watch",
-		"typecheck": "tsc --noEmit",
 		"fmt": "oxfmt",
 		"lint": "oxlint",
 		"eval": "node --conditions source src/eval.ts",
@@ -48,11 +47,11 @@
 	},
 	"devDependencies": {
 		"@types/node": "^25.5.0",
-		"bumpp": "^10.4.1",
+		"bumpp": "^11.0.1",
 		"lande": "^1.0.10",
-		"oxfmt": "^0.40.0",
-		"oxlint": "^1.55.0",
-		"oxlint-tsgolint": "^0.16.0",
-		"typescript": "^5.9.3"
+		"oxfmt": "^0.43.0",
+		"oxlint": "^1.58.0",
+		"oxlint-tsgolint": "^0.19.0",
+		"typescript": "^6.0.2"
 	}
 }
