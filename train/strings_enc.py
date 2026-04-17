@@ -1,15 +1,13 @@
-"""string-storage encodings for binary weight files.
+"""prefix-shared ngram string encoding for binary weight files.
 
-format v5 adds a "prefix" encoding for the ngram string payload. each bucket
-(unigrams, bigrams, ...) is sorted lexicographically so consecutive entries
-share long byte-level prefixes. each entry is emitted as a single nibble-packed
-length byte `(shared_len << 4) | suffix_len` followed by the suffix bytes.
+each bucket (unigrams, bigrams, ...) is sorted lexicographically so consecutive
+entries share long byte-level prefixes. each entry is emitted as a single
+nibble-packed header byte `(shared_len << 4) | suffix_len` followed by the
+suffix bytes. the loader resets the "previous bytes" buffer at each bucket
+boundary so bucket-level slicing via ngramCounts[] still works.
 
-the loader resets the "previous bytes" buffer at each bucket boundary so
-bucket-level slicing via ngramCounts[] still works.
-
-the max observed shared/suffix length across all groups is 12 bytes, well
-within the 4-bit range (0..15). the encoder asserts this invariant.
+shared and suffix lengths are each 4 bits, capping at 15 bytes. the encoder
+asserts this invariant.
 """
 
 from __future__ import annotations

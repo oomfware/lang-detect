@@ -15,6 +15,7 @@ from experiments import EXPERIMENTS
 from train import (
     DATASET_TRAIN_PERC,
     UNIQUE_SCRIPT_LANGS,
+    collect_nn_langs,
     evaluate,
     load_checkpoint,
     resolve_groups,
@@ -39,12 +40,9 @@ def main() -> None:
     groups = resolve_groups(args.experiment)
     results = load_checkpoint(args.experiment, groups)
 
-    all_nn_langs = list(dict.fromkeys(
-        lang for g in groups.values() for lang in g.langs
-    ))
     unique_script_langs = list(UNIQUE_SCRIPT_LANGS.keys())
     cjk_langs = ["jpn", "cmn"]
-    all_langs = list(dict.fromkeys(unique_script_langs + cjk_langs + all_nn_langs))
+    all_langs = list(dict.fromkeys(unique_script_langs + cjk_langs + collect_nn_langs(groups)))
 
     # UDHR eval
     udhr_data = load_udhr(set(all_langs))

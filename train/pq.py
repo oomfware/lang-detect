@@ -41,6 +41,50 @@ def _kmeans_pp_init(x: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarr
     return np.stack(centers, axis=0).astype(x.dtype)
 
 
+def _sq_euclid_np(
+    x: np.ndarray,
+    centroids: np.ndarray,
+    x2: np.ndarray | None = None,
+) -> np.ndarray:
+    """squared euclidean distances from each row of x to each centroid.
+
+    expansion: ||x||² + ||c||² − 2 x·cᵀ. the per-point ||x||² term is invariant
+    across inner loops, so callers may hoist it and pass via `x2`.
+    """
+    if x2 is None:
+        x2 = (x * x).sum(axis=1, keepdims=True)
+    c2 = (centroids * centroids).sum(axis=1)
+    return x2 + c2 - 2.0 * (x @ centroids.T)
+
+
+def _normalize_and_reshape(
+    weight: torch.Tensor,
+    d: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """per-row absmax-normalize a [out, in] weight matrix, pad to multiple of D,
+    and flatten to (out*subvectors, d) subvectors for codebook work.
+
+    row_scale is stored as `1/absmax` (divisor) to match the int6 quantization
+    convention where the TS decoder does `weight = value / scale`.
+
+    @returns (subvectors[n*sv, d], row_scale[n] f32, padded_in)
+    """
+    w = weight.detach().cpu().float().numpy()
+    out_size, in_size = w.shape
+
+    absmax = np.maximum(np.abs(w).max(axis=1), 1e-12)
+    row_scale = (1.0 / absmax).astype(np.float32)
+    w_norm = w * row_scale[:, None]
+
+    pad = (-in_size) % d
+    padded_in = in_size + pad
+    if pad:
+        w_norm = np.concatenate([w_norm, np.zeros((out_size, pad), dtype=w_norm.dtype)], axis=1)
+
+    subvectors = padded_in // d
+    return w_norm.reshape(out_size * subvectors, d), row_scale, padded_in
+
+
 def _kmeans_numpy(
     x: np.ndarray,
     k: int,
@@ -61,15 +105,14 @@ def _kmeans_numpy(
         init = _kmeans_pp_init(x, k, rng)
     centroids = init
 
+    # x² is invariant across iterations — compute once and reuse
+    x2 = (x * x).sum(axis=1, keepdims=True)
     labels = np.zeros(n, dtype=np.int64)
+    d2 = np.empty((n, k), dtype=x.dtype)
     for _ in range(iters):
-        # assign: squared euclidean via expansion: d2 = ||x||^2 + ||c||^2 - 2 x c^T
-        x2 = (x * x).sum(axis=1, keepdims=True)
-        c2 = (centroids * centroids).sum(axis=1)
-        d2 = x2 + c2 - 2.0 * (x @ centroids.T)
+        d2 = _sq_euclid_np(x, centroids, x2)
         labels = np.argmin(d2, axis=1)
 
-        # update
         new_centroids = np.zeros_like(centroids)
         counts = np.zeros(k, dtype=np.int64)
         np.add.at(new_centroids, labels, x)
@@ -88,10 +131,7 @@ def _kmeans_numpy(
         new_centroids[nonempty] /= counts[nonempty, None]
         centroids = new_centroids
 
-    # final mse
-    x2 = (x * x).sum(axis=1, keepdims=True)
-    c2 = (centroids * centroids).sum(axis=1)
-    d2 = x2 + c2 - 2.0 * (x @ centroids.T)
+    d2 = _sq_euclid_np(x, centroids, x2)
     labels = np.argmin(d2, axis=1)
     mse = float(d2[np.arange(n), labels].mean())
     return centroids.astype(np.float32), labels.astype(np.uint8), mse
@@ -103,7 +143,7 @@ def pq_encode_weights(
     d: int = PQ_D,
     seed: int = 0,
     restarts: int = 4,
-) -> tuple[np.ndarray, np.ndarray, list[float], int, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
     """encode a 2D weight matrix with product quantization on D-dim subvectors.
 
     per-row absmax scaling is applied first so the codebook operates in unit scale.
@@ -114,30 +154,15 @@ def pq_encode_weights(
     @param d subvector length
     @param seed k-means random seed
     @param restarts number of k-means restarts (best-mse is kept)
-    @returns (codebook[k,d] f32, indices[out, subvectors] u8, row_scales, padded_in, mse)
+    @returns (codebook[k,d] f32, indices[out, subvectors] u8, row_scales f32[out], padded_in, mse)
     """
-    w = weight.detach().cpu().float().numpy()
-    out_size, in_size = w.shape
-
-    # per-row absmax normalization. scale here is the divisor: row / absmax ∈ [-1, 1].
-    # to match the int6 "scale" convention (multiplier) we store scale = 1/absmax.
-    absmax = np.maximum(np.abs(w).max(axis=1), 1e-12)
-    row_scale = (1.0 / absmax).astype(np.float32)
-    w_norm = w * row_scale[:, None]  # each row now in [-1, 1]
-
-    # pad input dim to a multiple of d
-    pad = (-in_size) % d
-    padded_in = in_size + pad
-    if pad:
-        w_norm = np.concatenate([w_norm, np.zeros((out_size, pad), dtype=w_norm.dtype)], axis=1)
-
-    # reshape to (out * subvectors, d) for k-means training over all subvectors
+    x, row_scale, padded_in = _normalize_and_reshape(weight, d)
+    out_size = weight.shape[0]
     subvectors = padded_in // d
-    x = w_norm.reshape(out_size * subvectors, d)
-    # run multiple restarts with different seeds, keep the lowest-mse clustering
+
     best_mse = float("inf")
-    best_centroids = None
-    best_labels = None
+    best_centroids: np.ndarray | None = None
+    best_labels: np.ndarray | None = None
     for s in range(restarts):
         centroids_s, labels_s, mse_s = _kmeans_numpy(x, k=k, iters=100, seed=seed + s)
         if mse_s < best_mse:
@@ -147,43 +172,30 @@ def pq_encode_weights(
     assert best_centroids is not None and best_labels is not None
     indices = best_labels.reshape(out_size, subvectors)
 
-    return best_centroids, indices, row_scale.tolist(), padded_in, best_mse
+    return best_centroids, indices, row_scale, padded_in, best_mse
 
 
 def pq_assign_indices(
     weight: torch.Tensor,
     centroids: np.ndarray,
-    d: int = PQ_D,
-) -> tuple[np.ndarray, np.ndarray, list[float], int, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
     """encode a 2D weight matrix using a pre-existing PQ codebook (no k-means).
 
-    identical normalization/padding as pq_encode_weights — only codebook training
-    is skipped. used when weights were QAT-tuned against a specific fixed codebook.
+    subvector length D is inferred from `centroids.shape[1]`. used when weights
+    were QAT-tuned against a specific fixed codebook.
     """
-    w = weight.detach().cpu().float().numpy()
-    out_size, in_size = w.shape
-
-    absmax = np.maximum(np.abs(w).max(axis=1), 1e-12)
-    row_scale = (1.0 / absmax).astype(np.float32)
-    w_norm = w * row_scale[:, None]
-
-    pad = (-in_size) % d
-    padded_in = in_size + pad
-    if pad:
-        w_norm = np.concatenate([w_norm, np.zeros((out_size, pad), dtype=w_norm.dtype)], axis=1)
-
+    d = int(centroids.shape[1])
+    x, row_scale, padded_in = _normalize_and_reshape(weight, d)
+    out_size = weight.shape[0]
     subvectors = padded_in // d
-    x = w_norm.reshape(out_size * subvectors, d)
 
     centroids32 = centroids.astype(np.float32)
-    x2 = (x * x).sum(axis=1, keepdims=True)
-    c2 = (centroids32 * centroids32).sum(axis=1)
-    d2 = x2 + c2 - 2.0 * (x @ centroids32.T)
+    d2 = _sq_euclid_np(x, centroids32)
     labels = np.argmin(d2, axis=1).astype(np.uint8)
     mse = float(d2[np.arange(x.shape[0]), labels].mean())
     indices = labels.reshape(out_size, subvectors)
 
-    return centroids32, indices, row_scale.tolist(), padded_in, mse
+    return centroids32, indices, row_scale, padded_in, mse
 
 
 def pq_snap_weights(
@@ -206,7 +218,6 @@ def pq_snap_weights(
     pad = (-in_size) % d
     padded_in = in_size + pad
 
-    # per-row absmax with clamp to avoid divide-by-zero
     absmax = weight.detach().abs().amax(dim=1).clamp_min(1e-12)
     w_norm = weight / absmax.unsqueeze(1)
 
@@ -216,20 +227,14 @@ def pq_snap_weights(
             dim=1,
         )
 
-    # (out, subvectors, d)
     subvectors = padded_in // d
-    sv = w_norm.reshape(out_size, subvectors, d)
-    flat_sv = sv.reshape(out_size * subvectors, d)
+    flat_sv = w_norm.reshape(out_size * subvectors, d)
 
-    # nearest centroid by squared euclidean distance
+    # nearest centroid by squared euclidean: ||x||² + ||c||² − 2 x·cᵀ
     x2 = (flat_sv * flat_sv).sum(dim=1, keepdim=True)
     c2 = (codebook * codebook).sum(dim=1)
     d2 = x2 + c2 - 2.0 * (flat_sv @ codebook.T)
     labels = torch.argmin(d2, dim=1)
 
-    # gather centroids and reshape back
-    snapped = codebook[labels].reshape(out_size, subvectors, d)
-    snapped = snapped.reshape(out_size, padded_in)[:, :in_size]
-
-    # denormalize
+    snapped = codebook[labels].reshape(out_size, padded_in)[:, :in_size]
     return snapped * absmax.unsqueeze(1)

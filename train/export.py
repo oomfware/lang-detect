@@ -9,7 +9,6 @@ strings.
 
 usage:
     uv run export.py -e NAME -o DIR
-    uv run export.py -e NAME -o DIR --pq-groups latin   # override: fresh k-means
 """
 
 from __future__ import annotations
@@ -30,36 +29,33 @@ from strings_enc import encode_prefix_buckets
 from train import load_checkpoint, resolve_groups
 
 
-# sentinel value in the quantBits header byte that signals product quantization.
-# decoders distinguish by matching this value instead of a bit width.
-PQ_QUANT_SENTINEL = 0xF4
-
-# reserved header byte at offset 2. runtime ignores it.
-HEADER_RESERVED_BYTE = 5
-
-# only int6 is supported alongside PQ. the runtime no longer carries an int8 path.
+# quantBits values for the 1-byte format discriminator in the header
+PQ_QUANT = 0xF4
 INT6_QUANT = 6
 
+# int6 uses signed values in [-31, 31] (6 bits with one wasted value)
+INT6_SCALE_MAX = 31
 
-def quantize_tensor(tensor: torch.Tensor, scale_max: int = 31) -> tuple[bytes, float]:
-    """quantize a float32 tensor with absmax scaling."""
+
+def quantize_tensor(tensor: torch.Tensor) -> tuple[bytes, float]:
+    """quantize a float32 tensor to int6 with absmax scaling."""
     flat = tensor.detach().cpu().flatten().float()
     absmax = flat.abs().max().item()
-    scale = scale_max / absmax if absmax > 0 else 1.0
-    quantized = (flat * scale).round().clamp(-scale_max, scale_max).to(torch.int8)
+    scale = INT6_SCALE_MAX / absmax if absmax > 0 else 1.0
+    quantized = (flat * scale).round().clamp(-INT6_SCALE_MAX, INT6_SCALE_MAX).to(torch.int8)
     return bytes(quantized.numpy().tobytes()), scale
 
 
-def quantize_per_row(tensor: torch.Tensor, scale_max: int = 31) -> tuple[bytes, list[float]]:
-    """quantize a 2D tensor with per-row absmax scaling for better precision."""
+def quantize_per_row(tensor: torch.Tensor) -> tuple[bytes, list[float]]:
+    """quantize a 2D tensor to int6 with per-row absmax scaling for better precision."""
     rows = tensor.detach().cpu().float()
     scales: list[float] = []
     quantized_rows: list[torch.Tensor] = []
     for row in rows:
         absmax = row.abs().max().item()
-        scale = scale_max / absmax if absmax > 0 else 1.0
+        scale = INT6_SCALE_MAX / absmax if absmax > 0 else 1.0
         scales.append(scale)
-        q = (row * scale).round().clamp(-scale_max, scale_max).to(torch.int8)
+        q = (row * scale).round().clamp(-INT6_SCALE_MAX, INT6_SCALE_MAX).to(torch.int8)
         quantized_rows.append(q)
     quantized = torch.cat(quantized_rows)
     return bytes(quantized.numpy().tobytes()), scales
@@ -105,12 +101,11 @@ def export_weights(
     langs: list[str],
     output_dir: Path,
     group_name: str,
-    use_pq: bool,
     pq_codebook: np.ndarray | None = None,
 ) -> None:
     """export a group's linear model to a single binary file.
 
-    header (18 bytes): "LD" u8 _reserved u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
+    header (17 bytes): "LD" u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
     langs: null-terminated UTF-8
     ngrams:
       - PQ (quantBits=0xF4):  null-terminated UTF-8 in logical order
@@ -123,15 +118,15 @@ def export_weights(
       - int6: packed int6 weights
     bias: packed int6 (always)
 
-    @param use_pq true when this group's weights should be product-quantized
-    @param pq_codebook optional fixed codebook from a QAT checkpoint; when absent
-      and use_pq is true, a fresh k-means is run at export time
+    @param pq_codebook fixed codebook from a QAT checkpoint — its presence
+      switches the group to PQ encoding. if absent, the group is int6.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_size = model.out_features
     input_size = model.in_features
     ngram_counts = [len(ngram_vocabs.get(k, [])) for k in NGRAM_TYPES]
+    use_pq = pq_codebook is not None
 
     # PQ pins ngram column order to the codebook; int6 is free to reorder
     # columns so we sort each bucket and prefix-share the encoded strings.
@@ -151,60 +146,46 @@ def export_weights(
             col_perm.extend(offset + i for i in p)
             offset += len(bucket)
 
-    # permute weight matrix columns to match encoded ngram order
     if col_perm == list(range(input_size)):
         weight = model.weight
     else:
         with torch.no_grad():
             weight = model.weight.detach().cpu()[:, col_perm].contiguous()
 
-    # bias always uses int6 (cheap and consistent, column-permutation-invariant)
-    b_bytes, b_scale = quantize_tensor(model.bias, 31)
+    b_bytes, b_scale = quantize_tensor(model.bias)
     b_bytes = pack_int6(b_bytes)
 
-    quant_bits = PQ_QUANT_SENTINEL if use_pq else INT6_QUANT
+    quant_bits = PQ_QUANT if use_pq else INT6_QUANT
     bin_path = output_dir / f"{group_name}.bin"
     with open(bin_path, "wb") as f:
         f.write(b"LD")
-        f.write(struct.pack("<2B", HEADER_RESERVED_BYTE, quant_bits))
+        f.write(struct.pack("<B", quant_bits))
         f.write(struct.pack("<2H", output_size, input_size))
         f.write(struct.pack("<5H", *ngram_counts))
         f.write(langs_bytes)
         f.write(ngrams_bytes)
 
         if use_pq:
-            if pq_codebook is not None:
-                codebook, indices, w_scales, padded_in, mse = pq_assign_indices(
-                    weight, pq_codebook, PQ_D,
-                )
-                source = "fixed (QAT)"
-            else:
-                codebook, indices, w_scales, padded_in, mse = pq_encode_weights(
-                    weight, k=PQ_K, d=PQ_D, seed=0,
-                )
-                source = "k-means"
-            subvectors_per_row = padded_in // PQ_D
+            codebook, indices, w_scales, padded_in, mse = pq_assign_indices(weight, pq_codebook)
+            k, d = codebook.shape
+            subvectors_per_row = padded_in // d
             print(
-                f"  [pq {source}] {group_name}: k={PQ_K} d={PQ_D} padded_in={padded_in} "
+                f"  [pq {group_name}] k={k} d={d} padded_in={padded_in} "
                 f"subvectors/row={subvectors_per_row} mse={mse:.6f}"
             )
 
-            # scales (per-row weight scales + single bias scale). row_scale stored
-            # as 1/absmax so the TS decoder can do weight = centroid / scale
-            # (mirrors the int6 per-row dequant convention where scale is a divisor).
-            f.write(struct.pack(f"<{output_size}f", *w_scales))
+            # row_scale stored as 1/absmax so the TS decoder does
+            # weight = centroid / scale (same convention as int6 per-row)
+            f.write(w_scales.astype(np.float32).tobytes())
             f.write(struct.pack("<f", b_scale))
 
-            # PQ metadata block
-            f.write(struct.pack("<H", PQ_K))
-            f.write(struct.pack("<B", PQ_D))
+            f.write(struct.pack("<H", k))
+            f.write(struct.pack("<B", d))
             f.write(struct.pack("<H", subvectors_per_row))
-
-            # codebook (K * D float32) + indices (uint8, row-major)
             f.write(codebook.astype(np.float32).tobytes())
             f.write(indices.astype(np.uint8).tobytes())
         else:
-            w_bytes, w_scales = quantize_per_row(weight, 31)
+            w_bytes, w_scales = quantize_per_row(weight)
             w_bytes = pack_int6(w_bytes)
             f.write(struct.pack(f"<{output_size}f", *w_scales))
             f.write(struct.pack("<f", b_scale))
@@ -222,9 +203,6 @@ def main() -> None:
                         help="experiment name to export")
     parser.add_argument("--output", "-o", type=Path, required=True,
                         help="output directory for weight files")
-    parser.add_argument("--pq-groups", type=str, default="",
-                        help="override: force PQ on these comma-separated groups (fresh k-means "
-                             "at export time, for checkpoints without a QAT codebook)")
     args = parser.parse_args()
 
     if args.experiment not in EXPERIMENTS:
@@ -232,35 +210,31 @@ def main() -> None:
         print(f"available: {', '.join(EXPERIMENTS.keys())}")
         sys.exit(1)
 
-    override_pq_groups = {g.strip() for g in args.pq_groups.split(",") if g.strip()}
-
     groups = resolve_groups(args.experiment)
     results = load_checkpoint(args.experiment, groups)
 
-    # auto-detect PQ from checkpoint: any group whose .pt has `pq_codebook`
-    # (attached during QAT) is exported as PQ using the stored codebook.
+    # QAT attaches `pq_codebook` to a group's .pt; presence switches that
+    # group to PQ encoding. we already loaded the files via load_checkpoint
+    # but those payloads weren't retained, so re-read just the codebook field.
     ckpt_dir = Path(__file__).parent / "checkpoints" / args.experiment
-    fixed_codebooks: dict[str, np.ndarray] = {}
+    pq_codebooks: dict[str, np.ndarray] = {}
     for group_name in groups:
         pt_path = ckpt_dir / f"{group_name}.pt"
-        if pt_path.exists():
-            raw = torch.load(pt_path, weights_only=False)
-            cb = raw.get("pq_codebook")
-            if cb is not None:
-                fixed_codebooks[group_name] = np.asarray(cb, dtype=np.float32)
-                print(f"  [pq] using fixed codebook from checkpoint for {group_name}")
+        if not pt_path.exists():
+            continue
+        cb = torch.load(pt_path, weights_only=False).get("pq_codebook")
+        if cb is not None:
+            pq_codebooks[group_name] = np.asarray(cb, dtype=np.float32)
 
     print(f"exporting weights to {args.output}/")
     for group_name, (model, ngram_vocabs, _) in results.items():
-        use_pq = group_name in fixed_codebooks or group_name in override_pq_groups
         export_weights(
             model,
             ngram_vocabs,
             groups[group_name].langs,
             args.output,
             group_name,
-            use_pq,
-            fixed_codebooks.get(group_name),
+            pq_codebooks.get(group_name),
         )
 
 

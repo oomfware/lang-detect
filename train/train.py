@@ -125,6 +125,11 @@ def resolve_groups(experiment_name: str) -> dict[str, GroupConfig]:
     return groups
 
 
+def collect_nn_langs(groups: dict[str, GroupConfig]) -> list[str]:
+    """flatten and deduplicate languages across all NN groups."""
+    return list(dict.fromkeys(lang for g in groups.values() for lang in g.langs))
+
+
 def load_checkpoint(
     experiment_name: str,
     groups: dict[str, GroupConfig],
@@ -631,20 +636,18 @@ def _calc_binary_size(
     model: nn.Module,
     ngram_vocabs: dict[str, list[str]],
     langs: list[str],
-    quant_bits: int = 6,
 ) -> int:
-    """calculate the exported binary size for a model."""
+    """estimate the int6 exported binary size for a model — used only for the
+    phase-2 training summary, before PQ and prefix-sharing are applied.
+    """
     output_size = model.out_features
     input_size = model.in_features
-    header = 18
+    header = 17
     lang_bytes = sum(len(l.encode("utf-8")) + 1 for l in langs)
     ngram_bytes = sum(len(g.encode("utf-8")) + 1 for v in ngram_vocabs.values() for g in v)
     scales = output_size * 4 + 4
     total_values = output_size * input_size + output_size
-    if quant_bits == 6:
-        data = (total_values * 6 + 7) // 8
-    else:
-        data = total_values
+    data = (total_values * 6 + 7) // 8
     return header + lang_bytes + ngram_bytes + scales + data
 
 
@@ -659,10 +662,7 @@ def run_full_pipeline(
     if train_cfg is None:
         train_cfg = TrainConfig()
 
-    # collect all languages for loading (deduplicate for langs in multiple groups)
-    all_nn_langs = list(dict.fromkeys(
-        lang for g in groups.values() for lang in g.langs
-    ))
+    all_nn_langs = collect_nn_langs(groups)
 
     if verbose:
         print(f"loading dataset for {len(all_nn_langs)} NN languages...")
@@ -780,10 +780,7 @@ def main() -> None:
         wide_train_cfg = TrainConfig(**wide_exp.get("train_cfg", {}))
 
         print("\n=== phase 1: training wide models for importance analysis ===")
-        all_nn_langs = list(dict.fromkeys(
-            lang for g in wide_groups.values() for lang in g.langs
-        ))
-        raw = load_dataset_raw(all_nn_langs, limit=train_cfg.data_limit)
+        raw = load_dataset_raw(collect_nn_langs(wide_groups), limit=train_cfg.data_limit)
 
         preset_vocabs: dict[str, dict[str, list[str]]] = {}
         for group_name, config in wide_groups.items():
@@ -810,18 +807,14 @@ def main() -> None:
     else:
         results = run_full_pipeline(groups, train_cfg)
 
-    # phase 3: quantization-aware fine-tuning for product-quantized groups (optional).
-    # attaches a fixed PQ codebook to each QAT'd checkpoint; export.py picks that up
-    # automatically to produce v4 PQ binaries.
+    # phase 3: quantization-aware fine-tuning for product-quantized groups.
+    # attaches a fixed PQ codebook to the QAT'd checkpoint; export auto-detects it.
     qat_cfg = exp.get("qat_pq")
     pq_codebooks: dict[str, np.ndarray] = {}
     if qat_cfg:
         qat_groups = qat_cfg.get("groups", [])
         print(f"\n=== phase 3: QAT for product quantization on {qat_groups} ===")
-        all_nn_langs = list(dict.fromkeys(
-            lang for g in groups.values() for lang in g.langs
-        ))
-        raw_qat = load_dataset_raw(all_nn_langs, limit=train_cfg.data_limit)
+        raw_qat = load_dataset_raw(collect_nn_langs(groups), limit=train_cfg.data_limit)
         for group_name in qat_groups:
             if group_name not in results:
                 continue
@@ -840,7 +833,6 @@ def main() -> None:
     total_time = time.time() - t0
     print(f"\ntotal time: {total_time:.1f}s")
 
-    # save checkpoint
     output_name = args.output_name or args.experiment
     ckpt_dir = Path(__file__).parent / "checkpoints" / output_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -853,8 +845,6 @@ def main() -> None:
         }
         if group_name in pq_codebooks:
             payload["pq_codebook"] = pq_codebooks[group_name]
-            payload["pq_k"] = PQ_K
-            payload["pq_d"] = PQ_D
         torch.save(payload, ckpt_dir / f"{group_name}.pt")
     print(f"checkpoint saved to {ckpt_dir}/")
 

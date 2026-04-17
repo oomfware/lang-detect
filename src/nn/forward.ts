@@ -59,10 +59,11 @@ const dequantize = (data: Int8Array, scale: number): Float32Array => {
 const dequantizePerRow = (data: Int8Array, scales: Float32Array, cols: number): Float32Array => {
 	const result = new Float32Array(data.length);
 	for (let row = 0; row < scales.length; row++) {
-		const scale = scales[row];
+		// scales[row] is 1/absmax — multiply by absmax in the hot loop
+		const invScale = 1 / scales[row];
 		const off = row * cols;
 		for (let col = 0; col < cols; col++) {
-			result[off + col] = data[off + col] / scale;
+			result[off + col] = data[off + col] * invScale;
 		}
 	}
 	return result;
@@ -204,21 +205,28 @@ const decodePq = (
 	d: number,
 ): Float32Array => {
 	const result = new Float32Array(outputSize * inputSize);
+	// only the last subvector can cross the padding boundary; the preceding ones
+	// always fill a full d-wide stride, so run the guard-free loop for those and
+	// handle the tail once per row.
+	const fullSubvectors = Math.floor(inputSize / d);
+	const tailLen = inputSize - fullSubvectors * d;
 	for (let row = 0; row < outputSize; row++) {
-		const scale = wScales[row];
+		// wScales is stored as 1/absmax (divisor); multiply is cheaper in the hot loop
+		const invScale = 1 / wScales[row];
 		const outOff = row * inputSize;
 		const idxOff = row * subvectorsPerRow;
-		for (let s = 0; s < subvectorsPerRow; s++) {
-			const code = indices[idxOff + s];
-			const cbOff = code * d;
+		for (let s = 0; s < fullSubvectors; s++) {
+			const cbOff = indices[idxOff + s] * d;
 			const colStart = s * d;
-			// guard against the padding tail that doesn't fit in the output row
-			const last = Math.min(d, inputSize - colStart);
-			if (last <= 0) {
-				break;
+			for (let t = 0; t < d; t++) {
+				result[outOff + colStart + t] = codebook[cbOff + t] * invScale;
 			}
-			for (let t = 0; t < last; t++) {
-				result[outOff + colStart + t] = codebook[cbOff + t] / scale;
+		}
+		if (tailLen > 0) {
+			const cbOff = indices[idxOff + fullSubvectors] * d;
+			const colStart = fullSubvectors * d;
+			for (let t = 0; t < tailLen; t++) {
+				result[outOff + colStart + t] = codebook[cbOff + t] * invScale;
 			}
 		}
 	}
@@ -233,7 +241,7 @@ const decodePq = (
  * layout, so those groups use null-terminated strings; int6 groups are free
  * to reorder columns and use prefix-shared string encoding.
  *
- *   header (18 bytes): "LD" u8 _reserved u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
+ *   header (17 bytes): "LD" u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
  *   langs: null-terminated UTF-8
  *   ngrams (per quantBits):
  *     - 0xF4 (PQ):  null-terminated UTF-8 in logical order
@@ -252,19 +260,18 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 	const bytes = new Uint8Array(bin);
 	const view = new DataView(bin);
 
-	const quantBits = bytes[3];
-	const outputSize = view.getUint16(4, true);
-	const inputSize = view.getUint16(6, true);
+	const quantBits = bytes[2];
+	const outputSize = view.getUint16(3, true);
+	const inputSize = view.getUint16(5, true);
 	const ngramCounts = [
-		view.getUint16(8, true),
-		view.getUint16(10, true),
-		view.getUint16(12, true),
-		view.getUint16(14, true),
-		view.getUint16(16, true),
+		view.getUint16(7, true),
+		view.getUint16(9, true),
+		view.getUint16(11, true),
+		view.getUint16(13, true),
+		view.getUint16(15, true),
 	];
 
-	// strings
-	let pos = 18;
+	let pos = 17;
 	const [langs, afterLangs] = readNullTermStrings(bytes, pos, outputSize);
 	pos = afterLangs;
 	const [allNgrams, afterNgrams] =
