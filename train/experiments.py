@@ -23,7 +23,6 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
             "latin": {"unigrams": 165, "bigrams": 425, "trigrams": 425, "quadgrams": 235, "pentagrams": 90},
         },
         "train_cfg": {"label_smoothing": 0.1, "truncate_aug": 0.75, "focal_gamma": 2.0},
-        "quant_bits": 6,
         "qat_pq": {
             "groups": ["latin"],
             "epochs": 20,

@@ -120,15 +120,18 @@ const unpack6 = (packed: Uint8Array, count: number): Int8Array => {
 
 const decoder = new TextDecoder();
 
+/** sentinel value in the quantBits header byte that signals product quantization. */
+const PQ_QUANT = 0xf4;
+
 /**
- * reads `count` null-terminated UTF-8 strings starting at `offset` in the buffer.
+ * reads `count` null-terminated UTF-8 strings starting at `offset`.
  *
  * @param bytes raw binary data
  * @param offset byte offset to start reading
  * @param count number of strings to read
  * @returns the strings and the byte offset after the last null terminator
  */
-const readStrings = (bytes: Uint8Array, offset: number, count: number): [string[], number] => {
+const readNullTermStrings = (bytes: Uint8Array, offset: number, count: number): [string[], number] => {
 	const strings: string[] = [];
 	let pos = offset;
 	for (let i = 0; i < count; i++) {
@@ -142,16 +145,45 @@ const readStrings = (bytes: Uint8Array, offset: number, count: number): [string[
 	return [strings, pos];
 };
 
-/** sentinel value in the quantBits header byte that signals product quantization. */
-const PQ_QUANT_SENTINEL = 0xf4;
+/**
+ * decodes nibble-packed prefix-shared ngram buckets.
+ *
+ * for each bucket, entries are stored as `u8 (shared<<4) | suffix_len` followed
+ * by the suffix bytes. the "previous bytes" buffer resets at bucket boundaries
+ * so downstream bucket-slicing by ngramCounts[] still works.
+ *
+ * @param bytes raw binary data
+ * @param offset byte offset to start reading
+ * @param counts per-bucket ngram counts (length 5)
+ * @returns the decoded strings (flat, in bucket order) and the new byte offset
+ */
+const readPrefixNgrams = (bytes: Uint8Array, offset: number, counts: number[]): [string[], number] => {
+	const strings: string[] = [];
+	let pos = offset;
+	// 4-bit shared/suffix nibbles cap each entry at 30 bytes
+	const scratch = new Uint8Array(32);
+	for (let bucket = 0; bucket < counts.length; bucket++) {
+		for (let i = 0; i < counts[bucket]; i++) {
+			const header = bytes[pos++];
+			const shared = header >> 4;
+			const suffixLen = header & 0x0f;
+			for (let k = 0; k < suffixLen; k++) {
+				scratch[shared + k] = bytes[pos + k];
+			}
+			pos += suffixLen;
+			strings.push(decoder.decode(scratch.subarray(0, shared + suffixLen)));
+		}
+	}
+	return [strings, pos];
+};
 
 /**
- * decodes a product-quantized weight matrix back into a dense float32 matrix.
+ * decodes a product-quantized weight matrix into a dense float32 matrix.
  *
- * codebook rows hold normalized centroid values; per-row absmax scales undo the
- * normalization applied at encode time. the encoder pads the input dimension
- * up to a multiple of D, so we materialize into the padded width and then
- * return only the first `inputSize` columns.
+ * codebook rows hold normalized centroid values; per-row absmax scales undo
+ * the normalization applied at encode time. the encoder pads the input
+ * dimension up to a multiple of D, so we materialize into the padded width
+ * and then return only the first `inputSize` columns.
  *
  * @param codebook K * D float32 centroids (row-major)
  * @param indices outputSize * subvectorsPerRow uint8 codebook indices
@@ -194,17 +226,24 @@ const decodePq = (
 };
 
 /**
- * loads a group model from a binary file containing metadata + quantized weights.
+ * loads a group model from a binary file produced by `train/export.py`.
  *
- * binary format (v4, backward-compatible with v3 for int6/int8 payloads):
- *   header (18 bytes): "LD" version quantBits outputSize inputSize ngramCounts[5]
- *   strings: null-terminated UTF-8 (langs then ngrams in type order)
- *   scales: f32le[outputSize] wScales, f32le bScale
- *   data (per quantBits):
- *     - 6 or 8: packed/raw int weights then bias
- *     - 0xF4 (PQ): u16le K, u8 D, u16le subvectorsPerRow,
- *                  f32le[K*D] codebook, u8[outputSize*subvectorsPerRow] indices,
- *                  then packed int6 bias
+ * the `quantBits` header byte drives both weight decoding and ngram string
+ * encoding. product quantization pins ngram columns to the codebook's subvector
+ * layout, so those groups use null-terminated strings; int6 groups are free
+ * to reorder columns and use prefix-shared string encoding.
+ *
+ *   header (18 bytes): "LD" u8 _reserved u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
+ *   langs: null-terminated UTF-8
+ *   ngrams (per quantBits):
+ *     - 0xF4 (PQ):  null-terminated UTF-8 in logical order
+ *     - 6 (int6):   nibble-packed prefix-shared per bucket
+ *   scales: f32le[outputSize] wScales + f32le bScale
+ *   weight data (per quantBits):
+ *     - 0xF4 (PQ):  u16le K, u8 D, u16le subvectorsPerRow,
+ *                   f32le[K*D] codebook, u8[outputSize*subvectorsPerRow] indices
+ *     - 6 (int6):   packed int6 weights
+ *   bias: packed int6 (always)
  *
  * @param bin raw binary data
  * @returns the loaded model ready for inference
@@ -213,7 +252,6 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 	const bytes = new Uint8Array(bin);
 	const view = new DataView(bin);
 
-	// header
 	const quantBits = bytes[3];
 	const outputSize = view.getUint16(4, true);
 	const inputSize = view.getUint16(6, true);
@@ -227,9 +265,12 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 
 	// strings
 	let pos = 18;
-	const [langs, afterLangs] = readStrings(bytes, pos, outputSize);
+	const [langs, afterLangs] = readNullTermStrings(bytes, pos, outputSize);
 	pos = afterLangs;
-	const [allNgrams, afterNgrams] = readStrings(bytes, pos, inputSize);
+	const [allNgrams, afterNgrams] =
+		quantBits === PQ_QUANT
+			? readNullTermStrings(bytes, pos, inputSize)
+			: readPrefixNgrams(bytes, pos, ngramCounts);
 	pos = afterNgrams;
 
 	// split ngrams by type
@@ -251,12 +292,11 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 	const bScale = view.getFloat32(pos, true);
 	pos += 4;
 
-	// quantized data
+	// quantized weight data
 	const wCount = outputSize * inputSize;
 	let w: Float32Array;
-	let b: Float32Array;
 
-	if (quantBits === PQ_QUANT_SENTINEL) {
+	if (quantBits === PQ_QUANT) {
 		const k = view.getUint16(pos, true);
 		pos += 2;
 		const d = bytes[pos];
@@ -276,23 +316,15 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 		pos += idxCount;
 
 		w = decodePq(codebook, indices, wScales, outputSize, inputSize, subvectorsPerRow, d);
-
-		// bias: packed int6
-		const bPackedSize = Math.ceil((outputSize * 3) / 4);
-		b = dequantize(unpack6(bytes.subarray(pos, pos + bPackedSize), outputSize), bScale);
-	} else if (quantBits === 6) {
+	} else {
 		const wPackedSize = Math.ceil((wCount * 3) / 4);
-		const bPackedSize = Math.ceil((outputSize * 3) / 4);
 		w = dequantizePerRow(unpack6(bytes.subarray(pos, pos + wPackedSize), wCount), wScales, inputSize);
 		pos += wPackedSize;
-		b = dequantize(unpack6(bytes.subarray(pos, pos + bPackedSize), outputSize), bScale);
-	} else {
-		const wData = new Int8Array(bin, pos, wCount);
-		w = dequantizePerRow(wData, wScales, inputSize);
-		pos += wCount;
-		const bData = new Int8Array(bin, pos, outputSize);
-		b = dequantize(bData, bScale);
 	}
+
+	// bias: packed int6
+	const bPackedSize = Math.ceil((outputSize * 3) / 4);
+	const b = dequantize(unpack6(bytes.subarray(pos, pos + bPackedSize), outputSize), bScale);
 
 	return {
 		meta: { langs, ngrams },
