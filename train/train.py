@@ -600,12 +600,32 @@ def run_full_pipeline(
 
 # ── CLI ──
 
+def _load_preset_vocabs(preset_name: str) -> dict[str, dict[str, list[str]]]:
+    """load ngram_vocabs from a named checkpoint to reuse as a fixed preset."""
+    ckpt_dir = Path(__file__).parent / "checkpoints" / preset_name
+    if not ckpt_dir.exists():
+        print(f"no checkpoint found at {ckpt_dir}/ to use as preset")
+        sys.exit(1)
+
+    preset: dict[str, dict[str, list[str]]] = {}
+    for pt in sorted(ckpt_dir.glob("*.pt")):
+        ckpt = torch.load(pt, weights_only=False)
+        preset[pt.stem] = ckpt["ngram_vocabs"]
+    return preset
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="lang-detect training")
     parser.add_argument("--experiment", "-e", required=True,
                         help="experiment name to run")
     parser.add_argument("--list", "-l", action="store_true",
                         help="list available experiments")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed for torch and stdlib RNG (controls nn.Linear init + DataLoader shuffle)")
+    parser.add_argument("--preset-from", type=str, default=None,
+                        help="load ngram_vocabs from this checkpoint dir and skip phase 1")
+    parser.add_argument("--output-name", type=str, default=None,
+                        help="override checkpoint output dir name (defaults to experiment name)")
     args = parser.parse_args()
 
     if args.list:
@@ -630,7 +650,24 @@ def main() -> None:
 
     t0 = time.time()
 
-    if "prune_from" in exp:
+    if args.seed is not None:
+        # seed before any dataloader/model init so shuffle + nn.Linear init are deterministic.
+        # dataset split and truncate_aug use random.Random(42) internally and stay fixed.
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        print(f"  seed: {args.seed}")
+
+    if args.preset_from is not None:
+        print(f"\n=== loading ngram_vocabs preset from checkpoint: {args.preset_from} ===")
+        preset_vocabs = _load_preset_vocabs(args.preset_from)
+        for group_name in groups:
+            if group_name not in preset_vocabs:
+                print(f"preset checkpoint {args.preset_from} missing group: {group_name}")
+                sys.exit(1)
+            counts = {t: len(v) for t, v in preset_vocabs[group_name].items() if v}
+            print(f"  {group_name}: {counts}")
+        results = run_full_pipeline(groups, train_cfg, preset_vocabs=preset_vocabs)
+    elif "prune_from" in exp:
         # two-phase: train wide model, prune by importance, retrain
         wide_exp = EXPERIMENTS[exp["prune_from"]]
         wide_groups = resolve_groups(exp["prune_from"])
@@ -671,7 +708,8 @@ def main() -> None:
     print(f"\ntotal time: {total_time:.1f}s")
 
     # save checkpoint
-    ckpt_dir = Path(__file__).parent / "checkpoints" / args.experiment
+    output_name = args.output_name or args.experiment
+    ckpt_dir = Path(__file__).parent / "checkpoints" / output_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     for group_name, (model, ngram_vocabs, accuracy) in results.items():
         torch.save({
