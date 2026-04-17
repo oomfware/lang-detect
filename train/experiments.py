@@ -4,7 +4,7 @@ from typing import Any
 
 EXPERIMENTS: dict[str, dict[str, Any]] = {
     "linear_mega_5g": {
-        "description": "wide linear with 5-grams for importance source",
+        "description": "wide linear with 5-grams — phase 1 source for importance selection",
         "overrides": {
             "cyrillic": {"unigrams": 500, "bigrams": 700, "trigrams": 700, "quadgrams": 500, "pentagrams": 400, "epochs": 32},
             "arabic": {"unigrams": 200, "bigrams": 300, "trigrams": 300, "quadgrams": 200, "pentagrams": 150, "epochs": 16},
@@ -14,7 +14,7 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
         "train_cfg": {"label_smoothing": 0.1},
     },
     "lean_v5": {
-        "description": "halved small groups, lean ratio favoring short n-grams",
+        "description": "shipped config — lean ratio + QAT product quantization on latin",
         "prune_from": "linear_mega_5g",
         "overrides": {
             "cyrillic": {"unigrams": 130, "bigrams": 280, "trigrams": 280, "quadgrams": 130},
@@ -24,5 +24,13 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
         },
         "train_cfg": {"label_smoothing": 0.1, "truncate_aug": 0.75, "focal_gamma": 2.0},
         "quant_bits": 6,
+        "qat_pq": {
+            "groups": ["latin"],
+            "epochs": 20,
+            "lr": 0.001,
+            "k": 256,
+            "d": 4,
+            "seed": 0,
+        },
     },
 }

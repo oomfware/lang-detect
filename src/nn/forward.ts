@@ -142,14 +142,69 @@ const readStrings = (bytes: Uint8Array, offset: number, count: number): [string[
 	return [strings, pos];
 };
 
+/** sentinel value in the quantBits header byte that signals product quantization. */
+const PQ_QUANT_SENTINEL = 0xf4;
+
 /**
- * loads a group model from a v3 binary file containing metadata + quantized weights.
+ * decodes a product-quantized weight matrix back into a dense float32 matrix.
  *
- * binary format:
- *   header (18 bytes): "LD" version(3) quantBits outputSize inputSize ngramCounts[5]
+ * codebook rows hold normalized centroid values; per-row absmax scales undo the
+ * normalization applied at encode time. the encoder pads the input dimension
+ * up to a multiple of D, so we materialize into the padded width and then
+ * return only the first `inputSize` columns.
+ *
+ * @param codebook K * D float32 centroids (row-major)
+ * @param indices outputSize * subvectorsPerRow uint8 codebook indices
+ * @param wScales per-row scales stored as 1/absmax (divisor, matching int6 convention)
+ * @param outputSize number of output rows
+ * @param inputSize true input dimension (unpadded)
+ * @param subvectorsPerRow number of subvectors per row (= paddedIn / D)
+ * @param d subvector length
+ * @returns dequantized float32 weight matrix (outputSize × inputSize, row-major)
+ */
+const decodePq = (
+	codebook: Float32Array,
+	indices: Uint8Array,
+	wScales: Float32Array,
+	outputSize: number,
+	inputSize: number,
+	subvectorsPerRow: number,
+	d: number,
+): Float32Array => {
+	const result = new Float32Array(outputSize * inputSize);
+	for (let row = 0; row < outputSize; row++) {
+		const scale = wScales[row];
+		const outOff = row * inputSize;
+		const idxOff = row * subvectorsPerRow;
+		for (let s = 0; s < subvectorsPerRow; s++) {
+			const code = indices[idxOff + s];
+			const cbOff = code * d;
+			const colStart = s * d;
+			// guard against the padding tail that doesn't fit in the output row
+			const last = Math.min(d, inputSize - colStart);
+			if (last <= 0) {
+				break;
+			}
+			for (let t = 0; t < last; t++) {
+				result[outOff + colStart + t] = codebook[cbOff + t] / scale;
+			}
+		}
+	}
+	return result;
+};
+
+/**
+ * loads a group model from a binary file containing metadata + quantized weights.
+ *
+ * binary format (v4, backward-compatible with v3 for int6/int8 payloads):
+ *   header (18 bytes): "LD" version quantBits outputSize inputSize ngramCounts[5]
  *   strings: null-terminated UTF-8 (langs then ngrams in type order)
  *   scales: f32le[outputSize] wScales, f32le bScale
- *   data: quantized weights (int8 or packed int6), then bias
+ *   data (per quantBits):
+ *     - 6 or 8: packed/raw int weights then bias
+ *     - 0xF4 (PQ): u16le K, u8 D, u16le subvectorsPerRow,
+ *                  f32le[K*D] codebook, u8[outputSize*subvectorsPerRow] indices,
+ *                  then packed int6 bias
  *
  * @param bin raw binary data
  * @returns the loaded model ready for inference
@@ -201,7 +256,31 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 	let w: Float32Array;
 	let b: Float32Array;
 
-	if (quantBits === 6) {
+	if (quantBits === PQ_QUANT_SENTINEL) {
+		const k = view.getUint16(pos, true);
+		pos += 2;
+		const d = bytes[pos];
+		pos += 1;
+		const subvectorsPerRow = view.getUint16(pos, true);
+		pos += 2;
+
+		// codebook is f32le[K*D]; align-safe read via DataView
+		const codebook = new Float32Array(k * d);
+		for (let i = 0; i < codebook.length; i++) {
+			codebook[i] = view.getFloat32(pos + i * 4, true);
+		}
+		pos += codebook.length * 4;
+
+		const idxCount = outputSize * subvectorsPerRow;
+		const indices = new Uint8Array(bin, pos, idxCount);
+		pos += idxCount;
+
+		w = decodePq(codebook, indices, wScales, outputSize, inputSize, subvectorsPerRow, d);
+
+		// bias: packed int6
+		const bPackedSize = Math.ceil((outputSize * 3) / 4);
+		b = dequantize(unpack6(bytes.subarray(pos, pos + bPackedSize), outputSize), bScale);
+	} else if (quantBits === 6) {
 		const wPackedSize = Math.ceil((wCount * 3) / 4);
 		const bPackedSize = Math.ceil((outputSize * 3) / 4);
 		w = dequantizePerRow(unpack6(bytes.subarray(pos, pos + wPackedSize), wCount), wScales, inputSize);

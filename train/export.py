@@ -1,9 +1,14 @@
 """
 export checkpoint weights to binary format.
 
+product-quantized groups are auto-detected from the checkpoint: if a group's
+`.pt` has a `pq_codebook` field (attached by QAT), it's exported as PQ.
+otherwise it uses scalar int6/int8 quantization.
+
 usage:
     uv run export.py -e NAME -o DIR
     uv run export.py -e NAME -o DIR --quant-bits 6
+    uv run export.py -e NAME -o DIR --pq-groups latin   # override: run fresh k-means
 """
 
 from __future__ import annotations
@@ -14,11 +19,18 @@ import struct
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from datasets import NGRAM_TYPES
 from experiments import EXPERIMENTS
+from pq import PQ_D, PQ_K, pq_assign_indices, pq_encode_weights
 from train import load_checkpoint, resolve_groups
+
+
+# format v4 sentinel: stored in the quantBits byte to signal product quantization.
+# decoders distinguish by matching this value instead of a bit width.
+PQ_QUANT_SENTINEL = 0xF4
 
 
 def quantize_tensor(tensor: torch.Tensor, scale_max: int = 127) -> tuple[bytes, float]:
@@ -87,33 +99,27 @@ def export_weights(
     group_name: str,
     quant_bits: int = 8,
     global_quant: bool = False,
+    use_pq: bool = False,
+    pq_codebook: np.ndarray | None = None,
 ) -> None:
     """export linear model weights + metadata to a single binary file.
 
-    format (v3):
-      header (18 bytes): "LD" u8 version(3) u8 quantBits u16le outputSize u16le inputSize
+    format (v4):
+      header (18 bytes): "LD" u8 version(4) u8 quantBits u16le outputSize u16le inputSize
               u16le[5] ngramCounts
       strings: null-terminated UTF-8 (langs then ngrams in type order)
       scales: f32le[outputSize] wScales, f32le bScale
-      data: quantized weights (int8 or packed int6), then bias
+      data (per quantBits):
+        - 6 or 8: packed/raw int weights then bias (v3 layout, carried forward)
+        - 0xF4 (PQ): u16le K, u8 D, u16le subvectorsPerRow, then
+                     f32le[K*D] codebook, u8[outputSize*subvectorsPerRow] indices,
+                     then bias (packed int6)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    scale_max = 31 if quant_bits == 6 else 127
     output_size = model.out_features
     input_size = model.in_features
     ngram_counts = [len(ngram_vocabs.get(k, [])) for k in NGRAM_TYPES]
-
-    # quantize
-    if global_quant:
-        w_bytes, w_scale = quantize_tensor(model.weight, scale_max)
-        w_scales = [w_scale] * output_size
-    else:
-        w_bytes, w_scales = quantize_per_row(model.weight, scale_max)
-    b_bytes, b_scale = quantize_tensor(model.bias, scale_max)
-    if quant_bits == 6:
-        w_bytes = pack_int6(w_bytes)
-        b_bytes = pack_int6(b_bytes)
 
     # encode strings
     all_ngrams: list[str] = []
@@ -122,11 +128,15 @@ def export_weights(
     langs_bytes = _encode_strings(langs)
     ngrams_bytes = _encode_strings(all_ngrams)
 
+    # bias always uses int6 path (cheap and consistent)
+    b_bytes, b_scale = quantize_tensor(model.bias, 31)
+    b_bytes = pack_int6(b_bytes)
+
     bin_path = output_dir / f"{group_name}.bin"
     with open(bin_path, "wb") as f:
-        # header (16 bytes)
+        header_quant_bits = PQ_QUANT_SENTINEL if use_pq else quant_bits
         f.write(b"LD")
-        f.write(struct.pack("<2B", 3, quant_bits))
+        f.write(struct.pack("<2B", 4, header_quant_bits))
         f.write(struct.pack("<2H", output_size, input_size))
         f.write(struct.pack("<5H", *ngram_counts))
 
@@ -134,13 +144,57 @@ def export_weights(
         f.write(langs_bytes)
         f.write(ngrams_bytes)
 
-        # scales
-        f.write(struct.pack(f"<{output_size}f", *w_scales))
-        f.write(struct.pack("<f", b_scale))
+        if use_pq:
+            if pq_codebook is not None:
+                codebook, indices, w_scales, padded_in, mse = pq_assign_indices(
+                    model.weight, pq_codebook, PQ_D,
+                )
+                source = "fixed (QAT)"
+            else:
+                codebook, indices, w_scales, padded_in, mse = pq_encode_weights(
+                    model.weight, k=PQ_K, d=PQ_D, seed=0,
+                )
+                source = "k-means"
+            subvectors_per_row = padded_in // PQ_D
+            print(
+                f"  [pq {source}] {group_name}: k={PQ_K} d={PQ_D} padded_in={padded_in} "
+                f"subvectors/row={subvectors_per_row} mse={mse:.6f}"
+            )
 
-        # quantized data
-        f.write(w_bytes)
-        f.write(b_bytes)
+            # scales (per-row weight scales + single bias scale)
+            # row_scale stored as 1/absmax so the TS decoder can do weight = centroid / scale
+            # (mirrors the int6 per-row dequant convention where scale is a divisor).
+            f.write(struct.pack(f"<{output_size}f", *w_scales))
+            f.write(struct.pack("<f", b_scale))
+
+            # PQ metadata block
+            f.write(struct.pack("<H", PQ_K))
+            f.write(struct.pack("<B", PQ_D))
+            f.write(struct.pack("<H", subvectors_per_row))
+
+            # codebook (K * D float32)
+            f.write(codebook.astype(np.float32).tobytes())
+
+            # indices (uint8) in row-major order
+            f.write(indices.astype(np.uint8).tobytes())
+
+            # bias (packed int6)
+            f.write(b_bytes)
+        else:
+            # v3-compatible int quant path
+            scale_max = 31 if quant_bits == 6 else 127
+            if global_quant:
+                w_bytes, w_scale = quantize_tensor(model.weight, scale_max)
+                w_scales = [w_scale] * output_size
+            else:
+                w_bytes, w_scales = quantize_per_row(model.weight, scale_max)
+            if quant_bits == 6:
+                w_bytes = pack_int6(w_bytes)
+
+            f.write(struct.pack(f"<{output_size}f", *w_scales))
+            f.write(struct.pack("<f", b_scale))
+            f.write(w_bytes)
+            f.write(b_bytes)
 
     bin_size = os.path.getsize(bin_path)
     print(f"  exported {group_name}: {bin_size / 1024:.1f}KB")
@@ -156,6 +210,9 @@ def main() -> None:
                         help="quantization bit width (overrides experiment config)")
     parser.add_argument("--global-quant", action="store_true",
                         help="use global (per-tensor) instead of per-row weight quantization")
+    parser.add_argument("--pq-groups", type=str, default="",
+                        help="override: force PQ on these comma-separated groups (fresh k-means "
+                             "at export time, for checkpoints without a QAT codebook)")
     args = parser.parse_args()
 
     if args.experiment not in EXPERIMENTS:
@@ -163,12 +220,27 @@ def main() -> None:
         print(f"available: {', '.join(EXPERIMENTS.keys())}")
         sys.exit(1)
 
+    override_pq_groups = {g.strip() for g in args.pq_groups.split(",") if g.strip()}
+
     exp = EXPERIMENTS[args.experiment]
     groups = resolve_groups(args.experiment)
     results = load_checkpoint(args.experiment, groups)
 
     # resolve per-group quant bits: CLI flag > experiment config > default (8)
     exp_quant = exp.get("quant_bits", 8)
+
+    # auto-detect PQ from checkpoint: any group whose .pt has `pq_codebook`
+    # (attached during QAT) is exported as PQ using the stored codebook.
+    ckpt_dir = Path(__file__).parent / "checkpoints" / args.experiment
+    fixed_codebooks: dict[str, np.ndarray] = {}
+    for group_name in groups:
+        pt_path = ckpt_dir / f"{group_name}.pt"
+        if pt_path.exists():
+            raw = torch.load(pt_path, weights_only=False)
+            cb = raw.get("pq_codebook")
+            if cb is not None:
+                fixed_codebooks[group_name] = np.asarray(cb, dtype=np.float32)
+                print(f"  [pq] using fixed codebook from checkpoint for {group_name}")
 
     print(f"exporting weights to {args.output}/")
     for group_name, (model, ngram_vocabs, _) in results.items():
@@ -178,7 +250,18 @@ def main() -> None:
             quant_bits = exp_quant.get(group_name, 8)
         else:
             quant_bits = exp_quant
-        export_weights(model, ngram_vocabs, groups[group_name].langs, args.output, group_name, quant_bits, args.global_quant)
+        use_pq = group_name in fixed_codebooks or group_name in override_pq_groups
+        export_weights(
+            model,
+            ngram_vocabs,
+            groups[group_name].langs,
+            args.output,
+            group_name,
+            quant_bits,
+            args.global_quant,
+            use_pq,
+            fixed_codebooks.get(group_name),
+        )
 
 
 if __name__ == "__main__":

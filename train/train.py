@@ -17,8 +17,10 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -30,6 +32,7 @@ from datasets import (
     make_datum,
 )
 from experiments import EXPERIMENTS
+from pq import PQ_D, PQ_K, pq_encode_weights, pq_snap_weights
 
 # ── constants ──
 
@@ -435,6 +438,109 @@ def train_group(
     return model, ngram_vocabs, accuracy
 
 
+# ── QAT for product quantization ──
+
+def qat_group_pq(
+    config: GroupConfig,
+    raw: dict[str, list[RawDatum]],
+    model: nn.Linear,
+    ngram_vocabs: dict[str, list[str]],
+    train_cfg: TrainConfig,
+    epochs: int,
+    lr: float,
+    k: int,
+    d: int,
+    seed: int,
+) -> tuple[nn.Linear, np.ndarray, float]:
+    """fine-tune a group's linear model with PQ applied via straight-through estimator.
+
+    the codebook is fit once on the incoming weights and frozen during training;
+    QAT pulls weights toward codebook-friendly positions without needing to re-fit.
+    the best snapped test-accuracy epoch is kept (snap-induced noise makes the last
+    epoch an unreliable pick).
+
+    @param config group config (langs, batch size, etc.)
+    @param raw loaded raw dataset dict
+    @param model trained phase-2 linear model (weights are mutated in-place)
+    @param ngram_vocabs preset vocabs used during phase 2 — reused here
+    @param train_cfg training config (focal gamma, label smoothing, truncate_aug)
+    @param epochs number of QAT epochs
+    @param lr learning rate
+    @param k codebook size
+    @param d subvector length
+    @param seed k-means + data-shuffle seed
+    @returns (tuned model, fixed codebook [k,d] f32, best snapped test accuracy %)
+    """
+    torch.manual_seed(seed)
+
+    train_x, train_y, test_x, test_y, _ = prepare_dataset(
+        raw, config.langs, config, preset_vocabs=ngram_vocabs,
+        truncate_aug=train_cfg.truncate_aug,
+    )
+
+    # fit codebook once on the phase-2 weights
+    centroids_np, _, _, _, init_mse = pq_encode_weights(model.weight, k=k, d=d, seed=seed)
+    codebook = torch.from_numpy(centroids_np).float()
+    print(f"  [qat-pq {config.name}] initial codebook mse: {init_mse:.6f}")
+
+    # baseline snapped acc (what shipping without QAT would look like)
+    model.eval()
+    with torch.no_grad():
+        orig_w = model.weight.data.clone()
+        model.weight.data = pq_snap_weights(model.weight, codebook, d)
+        base_snap_acc = (model(test_x).argmax(dim=1) == test_y).float().mean().item() * 100
+        model.weight.data = orig_w
+
+    if train_cfg.focal_gamma > 0:
+        criterion = FocalLoss(gamma=train_cfg.focal_gamma, label_smoothing=train_cfg.label_smoothing)
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.label_smoothing)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+
+    train_loader = DataLoader(
+        TensorDataset(train_x, train_y), batch_size=config.batch_size, shuffle=True,
+    )
+
+    best_snap_acc = base_snap_acc
+    best_state = {s_key: s_val.clone() for s_key, s_val in model.state_dict().items()}
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        batches = 0
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            # straight-through estimator: snap on forward, identity on backward
+            w_q = pq_snap_weights(model.weight, codebook, d)
+            w_eff = model.weight + (w_q - model.weight).detach()
+            logits = F.linear(batch_x, w_eff, model.bias)
+            loss = criterion(logits, batch_y)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            batches += 1
+
+        # eval with deployment-identical snapped weights
+        model.eval()
+        with torch.no_grad():
+            orig_w = model.weight.data.clone()
+            model.weight.data = pq_snap_weights(model.weight, codebook, d)
+            snap_acc = (model(test_x).argmax(dim=1) == test_y).float().mean().item() * 100
+            model.weight.data = orig_w
+
+        if snap_acc > best_snap_acc:
+            best_snap_acc = snap_acc
+            best_state = {s_key: s_val.clone() for s_key, s_val in model.state_dict().items()}
+
+        if (epoch + 1) % max(1, epochs // 5) == 0:
+            print(f"  [qat-pq {config.name}] epoch {epoch + 1}/{epochs} — "
+                  f"loss {epoch_loss / batches:.4f} — snapped {snap_acc:.2f}%")
+
+    model.load_state_dict(best_state)
+    print(f"  [qat-pq {config.name}] best snapped acc: {best_snap_acc:.2f}% "
+          f"(baseline snapped: {base_snap_acc:.2f}%)")
+    return model, centroids_np, best_snap_acc
+
+
 # ── evaluation ──
 
 def detect_language(
@@ -704,6 +810,33 @@ def main() -> None:
     else:
         results = run_full_pipeline(groups, train_cfg)
 
+    # phase 3: quantization-aware fine-tuning for product-quantized groups (optional).
+    # attaches a fixed PQ codebook to each QAT'd checkpoint; export.py picks that up
+    # automatically to produce v4 PQ binaries.
+    qat_cfg = exp.get("qat_pq")
+    pq_codebooks: dict[str, np.ndarray] = {}
+    if qat_cfg:
+        qat_groups = qat_cfg.get("groups", [])
+        print(f"\n=== phase 3: QAT for product quantization on {qat_groups} ===")
+        all_nn_langs = list(dict.fromkeys(
+            lang for g in groups.values() for lang in g.langs
+        ))
+        raw_qat = load_dataset_raw(all_nn_langs, limit=train_cfg.data_limit)
+        for group_name in qat_groups:
+            if group_name not in results:
+                continue
+            model_q, vocabs_q, _ = results[group_name]
+            tuned, codebook, qat_acc = qat_group_pq(
+                groups[group_name], raw_qat, model_q, vocabs_q, train_cfg,
+                epochs=qat_cfg.get("epochs", 20),
+                lr=qat_cfg.get("lr", 0.001),
+                k=qat_cfg.get("k", PQ_K),
+                d=qat_cfg.get("d", PQ_D),
+                seed=qat_cfg.get("seed", 0),
+            )
+            results[group_name] = (tuned, vocabs_q, qat_acc)
+            pq_codebooks[group_name] = codebook
+
     total_time = time.time() - t0
     print(f"\ntotal time: {total_time:.1f}s")
 
@@ -712,12 +845,17 @@ def main() -> None:
     ckpt_dir = Path(__file__).parent / "checkpoints" / output_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     for group_name, (model, ngram_vocabs, accuracy) in results.items():
-        torch.save({
+        payload: dict[str, object] = {
             "state_dict": model.state_dict(),
             "ngram_vocabs": ngram_vocabs,
             "langs": groups[group_name].langs,
             "accuracy": accuracy,
-        }, ckpt_dir / f"{group_name}.pt")
+        }
+        if group_name in pq_codebooks:
+            payload["pq_codebook"] = pq_codebooks[group_name]
+            payload["pq_k"] = PQ_K
+            payload["pq_d"] = PQ_D
+        torch.save(payload, ckpt_dir / f"{group_name}.pt")
     print(f"checkpoint saved to {ckpt_dir}/")
 
 
