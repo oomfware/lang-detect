@@ -16,6 +16,7 @@ EXPERIMENTS: dict[str, dict[str, Any]] = {
     "lean_v5": {
         "description": "shipped config — lean ratio + QAT product quantization on latin",
         "prune_from": "linear_mega_5g",
+        "seed": 0,
         "overrides": {
             "cyrillic": {"unigrams": 130, "bigrams": 280, "trigrams": 280, "quadgrams": 130},
             "arabic": {"unigrams": 25, "bigrams": 50, "trigrams": 50, "quadgrams": 25},

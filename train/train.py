@@ -756,7 +756,7 @@ def main() -> None:
     parser.add_argument("--list", "-l", action="store_true",
                         help="list available experiments")
     parser.add_argument("--seed", type=int, default=None,
-                        help="seed for torch and stdlib RNG (controls nn.Linear init + DataLoader shuffle)")
+                        help="seed for torch and stdlib RNG (controls nn.Linear init + DataLoader shuffle); overrides experiment config's seed if set")
     parser.add_argument("--preset-from", type=str, default=None,
                         help="load ngram_vocabs from this checkpoint dir and skip phase 1")
     parser.add_argument("--output-name", type=str, default=None,
@@ -785,12 +785,13 @@ def main() -> None:
 
     t0 = time.time()
 
-    if args.seed is not None:
+    seed = args.seed if args.seed is not None else exp.get("seed")
+    if seed is not None:
         # seed before any dataloader/model init so shuffle + nn.Linear init are deterministic.
         # dataset split and truncate_aug use random.Random(42) internally and stay fixed.
-        torch.manual_seed(args.seed)
-        random.seed(args.seed)
-        print(f"  seed: {args.seed}")
+        torch.manual_seed(seed)
+        random.seed(seed)
+        print(f"  seed: {seed}")
 
     if args.preset_from is not None:
         print(f"\n=== loading ngram_vocabs preset from checkpoint: {args.preset_from} ===")
