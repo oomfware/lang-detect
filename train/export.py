@@ -2,10 +2,10 @@
 export checkpoint weights to binary format.
 
 product-quantized groups are auto-detected from the checkpoint: if a group's
-`.pt` has a `pq_codebook` field (attached by QAT), it's exported as PQ with
-null-terminated ngram strings (PQ pins column order to the codebook's subvector
-layout). other groups use int6 per-row quantization and prefix-shared ngram
-strings.
+`.pt` has a `pq_codebook` field (attached by QAT), it's exported as PQ; other
+groups use int6 per-row quantization. both formats share the same prefix-shared
+ngram string encoding — this requires the checkpoint's vocabs to be in canonical
+(per-bucket sorted) order, which `train.py` enforces before phase 3 QAT.
 
 usage:
     uv run export.py -e NAME -o DIR
@@ -107,10 +107,9 @@ def export_weights(
 
     header (17 bytes): "LD" u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
     langs: null-terminated UTF-8
-    ngrams:
-      - PQ (quantBits=0xF4):  null-terminated UTF-8 in logical order
-      - int6 (quantBits=6):   nibble-packed prefix-shared per bucket (weight columns
-                              permuted to match the lexicographically sorted order)
+    ngrams: nibble-packed prefix-shared per bucket (weight columns permuted to
+      match the lexicographically sorted order — for PQ this permutation must be
+      identity, which `train.canonicalize_vocabs` enforces before QAT)
     scales: f32le[outputSize] wScales + f32le bScale
     weight data:
       - PQ:   u16le K, u8 D, u16le subvectorsPerRow, f32le[K*D] codebook,
@@ -128,25 +127,25 @@ def export_weights(
     ngram_counts = [len(ngram_vocabs.get(k, [])) for k in NGRAM_TYPES]
     use_pq = pq_codebook is not None
 
-    # PQ pins ngram column order to the codebook; int6 is free to reorder
-    # columns so we sort each bucket and prefix-share the encoded strings.
     langs_bytes = _encode_null_term_strings(langs)
-    if use_pq:
-        all_ngrams: list[str] = []
-        for k in NGRAM_TYPES:
-            all_ngrams.extend(ngram_vocabs.get(k, []))
-        ngrams_bytes = _encode_null_term_strings(all_ngrams)
-        col_perm = list(range(input_size))
-    else:
-        buckets = [list(ngram_vocabs.get(k, [])) for k in NGRAM_TYPES]
-        ngrams_bytes, perms = encode_prefix_buckets(buckets)
-        col_perm = []
-        offset = 0
-        for bucket, p in zip(buckets, perms, strict=True):
-            col_perm.extend(offset + i for i in p)
-            offset += len(bucket)
+    buckets = [list(ngram_vocabs.get(k, [])) for k in NGRAM_TYPES]
+    ngrams_bytes, perms = encode_prefix_buckets(buckets)
+    col_perm: list[int] = []
+    offset = 0
+    for bucket, p in zip(buckets, perms, strict=True):
+        col_perm.extend(offset + i for i in p)
+        offset += len(bucket)
 
-    if col_perm == list(range(input_size)):
+    is_identity = col_perm == list(range(input_size))
+    if use_pq and not is_identity:
+        # PQ indices are positional against the codebook's subvector layout;
+        # re-sorting columns after QAT would invalidate them.
+        raise ValueError(
+            f"PQ checkpoint for {group_name!r} is not in canonical vocab order. "
+            f"retrain with the current train.py so canonicalize_vocabs runs before QAT.",
+        )
+
+    if is_identity:
         weight = model.weight
     else:
         with torch.no_grad():

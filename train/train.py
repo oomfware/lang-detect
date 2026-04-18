@@ -33,6 +33,7 @@ from datasets import (
 )
 from experiments import EXPERIMENTS
 from pq import PQ_D, PQ_K, pq_encode_weights, pq_snap_weights
+from strings_enc import bucket_sort_perms
 
 # ── constants ──
 
@@ -151,6 +152,34 @@ def load_checkpoint(
         results[group_name] = (model, ckpt["ngram_vocabs"], ckpt["accuracy"])
 
     return results
+
+
+def canonicalize_vocabs(
+    model: nn.Linear,
+    ngram_vocabs: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """sort each bucket by UTF-8 bytes and permute weight columns to match.
+
+    runs before phase 3 so the PQ codebook is fit on sorted-column weights —
+    this is what lets PQ groups share the int6 groups' prefix-shared string
+    encoding at export time (both then use an identity column permutation).
+    """
+    buckets = [ngram_vocabs.get(t, []) for t in NGRAM_TYPES]
+    perms = bucket_sort_perms(buckets)
+
+    col_perm: list[int] = []
+    offset = 0
+    new_vocabs: dict[str, list[str]] = {}
+    for ngram_type, bucket, order in zip(NGRAM_TYPES, buckets, perms, strict=True):
+        new_vocabs[ngram_type] = [bucket[i] for i in order]
+        col_perm.extend(offset + i for i in order)
+        offset += len(bucket)
+
+    with torch.no_grad():
+        perm = torch.tensor(col_perm, dtype=torch.long)
+        model.weight.data = model.weight.data[:, perm].contiguous()
+
+    return new_vocabs
 
 
 # ── ngram selection ──
@@ -806,6 +835,10 @@ def main() -> None:
         results = run_full_pipeline(groups, train_cfg, preset_vocabs=preset_vocabs)
     else:
         results = run_full_pipeline(groups, train_cfg)
+
+    print("\n=== canonicalizing vocabs (lex sort per bucket) ===")
+    for group_name, (model, vocabs, accuracy) in results.items():
+        results[group_name] = (model, canonicalize_vocabs(model, vocabs), accuracy)
 
     # phase 3: quantization-aware fine-tuning for product-quantized groups.
     # attaches a fixed PQ codebook to the QAT'd checkpoint; export auto-detects it.

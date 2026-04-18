@@ -16,6 +16,22 @@ from __future__ import annotations
 _NIBBLE_MAX = 15
 
 
+def bucket_sort_perms(buckets: list[list[str]]) -> list[list[int]]:
+    """compute the canonical per-bucket sort order used by prefix encoding.
+
+    shared with `train.canonicalize_vocabs` so training-time canonicalization
+    and export-time encoding agree on the column order.
+
+    @param buckets list of ngram buckets (one list per ngram type)
+    @returns permutations[i][j] = original index within bucket i of the j-th
+      entry in sorted order
+    """
+    return [
+        sorted(range(len(bucket)), key=lambda i, b=bucket: b[i].encode("utf-8"))
+        for bucket in buckets
+    ]
+
+
 def encode_prefix_buckets(buckets: list[list[str]]) -> tuple[bytes, list[list[int]]]:
     """encode ngram buckets using nibble-packed prefix sharing.
 
@@ -30,15 +46,11 @@ def encode_prefix_buckets(buckets: list[list[str]]) -> tuple[bytes, list[list[in
     @throws ValueError if any shared or suffix length exceeds 15 bytes
     """
     out = bytearray()
-    perms: list[list[int]] = []
-    for bucket in buckets:
-        # sort indices by utf-8-encoded string bytes so we can permute weights
-        encoded = [s.encode("utf-8") for s in bucket]
-        order = sorted(range(len(bucket)), key=lambda i: encoded[i])
-        perms.append(order)
+    perms = bucket_sort_perms(buckets)
+    for bucket, order in zip(buckets, perms, strict=True):
         prev = b""
         for i in order:
-            cur = encoded[i]
+            cur = bucket[i].encode("utf-8")
             m = min(len(cur), len(prev))
             shared = 0
             while shared < m and cur[shared] == prev[shared]:

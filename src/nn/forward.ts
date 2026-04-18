@@ -236,16 +236,14 @@ const decodePq = (
 /**
  * loads a group model from a binary file produced by `train/export.py`.
  *
- * the `quantBits` header byte drives both weight decoding and ngram string
- * encoding. product quantization pins ngram columns to the codebook's subvector
- * layout, so those groups use null-terminated strings; int6 groups are free
- * to reorder columns and use prefix-shared string encoding.
+ * the `quantBits` header byte selects the weight codec (PQ vs int6). ngram
+ * strings are always prefix-shared per bucket, independent of the weight
+ * codec — PQ checkpoints are produced with vocabs already in canonical sort
+ * order so the codebook stays aligned with the prefix-encoded columns.
  *
  *   header (17 bytes): "LD" u8 quantBits u16le outputSize u16le inputSize u16le[5] ngramCounts
  *   langs: null-terminated UTF-8
- *   ngrams (per quantBits):
- *     - 0xF4 (PQ):  null-terminated UTF-8 in logical order
- *     - 6 (int6):   nibble-packed prefix-shared per bucket
+ *   ngrams: nibble-packed prefix-shared per bucket
  *   scales: f32le[outputSize] wScales + f32le bScale
  *   weight data (per quantBits):
  *     - 0xF4 (PQ):  u16le K, u8 D, u16le subvectorsPerRow,
@@ -274,10 +272,7 @@ export const loadModel = (bin: ArrayBuffer): ReadyModel => {
 	let pos = 17;
 	const [langs, afterLangs] = readNullTermStrings(bytes, pos, outputSize);
 	pos = afterLangs;
-	const [allNgrams, afterNgrams] =
-		quantBits === PQ_QUANT
-			? readNullTermStrings(bytes, pos, inputSize)
-			: readPrefixNgrams(bytes, pos, ngramCounts);
+	const [allNgrams, afterNgrams] = readPrefixNgrams(bytes, pos, ngramCounts);
 	pos = afterNgrams;
 
 	// split ngrams by type
